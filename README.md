@@ -10,7 +10,7 @@ The first source adapter reads Claude Code's local transcripts. The pricing, pla
 cargo install --path .
 ```
 
-Rust 1.85 or later.
+Rust 1.88 or later.
 
 ## Use
 
@@ -25,6 +25,8 @@ tokentab estimate --format json
 tokentab prices                         # the compiled-in price list and plan catalog
 ```
 
+`--seats` takes 1 to 10,000 and `--allowance-anchor` takes 0 to 100,000 dollars.
+
 `--pricing path.toml` replaces the compiled-in price list. The file format is `pricing/anthropic.toml`.
 
 ## What the report contains
@@ -32,7 +34,7 @@ tokentab prices                         # the compiled-in price list and plan ca
 1. Scan counts: files seen, lines read, unparseable lines, assistant lines, requests before and after deduplication, requests filtered out, and every request the price list could not price, by reason. A run that finds no files or prices nothing exits non-zero instead of printing a clean zero.
 2. Usage by month at API rates, split into interactive and headless (SDK) usage.
 3. One row per plan: average month, peak month, and the total over the range, followed by the assumptions each number rests on.
-4. Usage patterns: the most expensive rolling 5-hour window and 7-day window, active days, sessions, subagent share, cost per model, per entry point and per project, and cache statistics with a no-cache counterfactual.
+4. Usage patterns: the most expensive rolling 5-hour window and 7-day window, active days, sessions, sidechain (subagent) share, cost per model, per entry point and per project, and cache statistics with a no-cache counterfactual.
 5. The assumptions in force: price list date, allowance anchor, seats, billing cycle, credits mode.
 
 ## How the numbers are computed
@@ -52,7 +54,7 @@ Plans are priced from `pricing/anthropic.toml`:
 
 Seat minimums are enforced and noted: Team bills at least 2 seats, Enterprise at least 20. The transcript is one seat's usage; additional seats carry their fee and nothing else.
 
-Months are UTC calendar months. Plan limits are enforced per rolling window, so the peak 5-hour and 7-day windows show where a plan would have throttled.
+Months are UTC calendar months. Every month from the start of the range to its end gets a row, idle months included, so seat plans pay for them; a month holding only unpriced requests gets none. A month is partial when the range starts or ends inside it (at `--since` and `--until`, or at the first and last priced request when they are not given); partial months are billed in full in the totals but left out of the average and peak month, unless every month is partial, and the report names them. The peak 5-hour and 7-day windows show the heaviest stretch of usage, which is where a rolling plan limit would bind first.
 
 ## Layout
 

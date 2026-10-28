@@ -1,7 +1,8 @@
 use std::fmt;
 
 use jiff::Timestamp;
-use serde::Serialize;
+use jiff::civil::Date;
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 use crate::domain::money::Money;
@@ -16,6 +17,17 @@ pub enum PlanKind {
     Subscription,
     /// Seat fee plus every token at API rates, no allowance (Claude Enterprise).
     SeatPlusUsage,
+}
+
+impl PlanKind {
+    /// The snake_case name the price list file uses for this kind.
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanKind::PayAsYouGo => "pay_as_you_go",
+            PlanKind::Subscription => "subscription",
+            PlanKind::SeatPlusUsage => "seat_plus_usage",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -69,7 +81,8 @@ pub struct EstimateOptions {
     pub allowance_anchor: Option<Money>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+/// Serializes as the string `YYYY-MM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct YearMonth {
     pub year: i16,
     pub month: i8,
@@ -77,11 +90,20 @@ pub struct YearMonth {
 
 impl YearMonth {
     pub fn of(timestamp: Timestamp) -> YearMonth {
-        let zoned = timestamp.to_zoned(jiff::tz::TimeZone::UTC);
+        YearMonth::of_date(timestamp.to_zoned(jiff::tz::TimeZone::UTC).date())
+    }
+
+    pub fn of_date(date: Date) -> YearMonth {
         YearMonth {
-            year: zoned.year(),
-            month: zoned.month(),
+            year: date.year(),
+            month: date.month(),
         }
+    }
+}
+
+impl Serialize for YearMonth {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 
@@ -95,10 +117,25 @@ impl fmt::Display for YearMonth {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MonthUsage {
     pub month: YearMonth,
+    /// First and last UTC day of this month inside the report range, both inclusive.
+    /// The month is complete when they are its first and last calendar day.
+    pub covered_from: Date,
+    pub covered_through: Date,
     pub interactive: Cost,
     pub headless: Cost,
     pub requests: u64,
     pub unpriced_requests: u64,
+}
+
+impl MonthUsage {
+    pub fn is_complete(&self) -> bool {
+        self.covered_from == self.covered_from.first_of_month()
+            && self.covered_through == self.covered_through.last_of_month()
+    }
+
+    pub fn days_covered(&self) -> i8 {
+        self.covered_through.day() - self.covered_from.day() + 1
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -126,7 +163,9 @@ pub struct PlanEstimate {
     pub plan_id: String,
     pub plan_name: String,
     pub kind: PlanKind,
+    pub seats_billed: u32,
     pub months: Vec<PlanMonth>,
+    /// Average and peak cover complete months only, unless every month is partial.
     pub average_month: Money,
     pub peak_month: Money,
     pub total: Money,
@@ -144,6 +183,8 @@ pub enum PlanError {
     NoBilling { plan: String },
     #[error("plan catalog has no plans")]
     EmptyCatalog,
+    #[error("plan {plan}: totals do not fit in u64 nanodollars")]
+    Overflow { plan: String },
 }
 
 /// Estimates every plan in the catalog against the same months of one seat's usage.
@@ -162,6 +203,9 @@ pub enum PlanError {
 /// - `SeatPlusUsage`: fee = seats x seat price; interactive + headless at API rates; no credits.
 /// - `sensitivity` recomputes the average month with the anchor halved and doubled,
 ///   only for `Subscription` plans.
+/// - `total` and the month rows cover every month, each billed a full seat fee and
+///   allowance. `average_month`, `peak_month` and the sensitivity averages cover the
+///   complete months only, unless every month is partial; a note names the partial months.
 pub fn estimate(
     catalog: &PlanCatalog,
     options: &EstimateOptions,
@@ -210,26 +254,28 @@ fn estimate_plan(
         seat_fee: seat_price.times(u64::from(seats_billed)),
     };
 
-    let plan_months = price_months(&terms, months, anchor);
-    let total: Money = plan_months.iter().map(|month| month.total).sum();
-    let peak_month = plan_months
-        .iter()
+    let averaged = averaged_months(months, &mut notes);
+    let overflow = || PlanError::Overflow {
+        plan: plan.id.clone(),
+    };
+
+    let plan_months = price_months(&terms, months, anchor).ok_or_else(overflow)?;
+    let total = checked_total(plan_months.iter()).ok_or_else(overflow)?;
+    let peak_month = select(&plan_months, &averaged)
         .map(|month| month.total)
         .max()
         .unwrap_or(Money::ZERO);
+    let average = average_month(&plan_months, &averaged).ok_or_else(overflow)?;
     let sensitivity = match plan.kind {
-        PlanKind::Subscription => Some(Sensitivity {
-            half_anchor_average_month: average_month(&price_months(
-                &terms,
-                months,
-                anchor.scale(0.5),
-            )),
-            double_anchor_average_month: average_month(&price_months(
-                &terms,
-                months,
-                anchor.times(2),
-            )),
-        }),
+        PlanKind::Subscription => {
+            let half = price_months(&terms, months, anchor.scale(0.5)).ok_or_else(overflow)?;
+            let double = price_months(&terms, months, anchor.times(2)).ok_or_else(overflow)?;
+            Some(Sensitivity {
+                half_anchor_average_month: average_month(&half, &averaged).ok_or_else(overflow)?,
+                double_anchor_average_month: average_month(&double, &averaged)
+                    .ok_or_else(overflow)?,
+            })
+        }
         PlanKind::PayAsYouGo | PlanKind::SeatPlusUsage => None,
     };
 
@@ -237,7 +283,8 @@ fn estimate_plan(
         plan_id: plan.id.clone(),
         plan_name: plan.name.clone(),
         kind: plan.kind,
-        average_month: average_month(&plan_months),
+        seats_billed,
+        average_month: average,
         months: plan_months,
         peak_month,
         total,
@@ -246,18 +293,67 @@ fn estimate_plan(
     })
 }
 
+/// Which months the average and peak cover: the complete ones, or every month when
+/// none is complete. Pushes one note naming the partial months, if there are any.
+fn averaged_months(months: &[MonthUsage], notes: &mut Vec<String>) -> Vec<bool> {
+    let partial: Vec<String> = months
+        .iter()
+        .filter(|month| !month.is_complete())
+        .map(|month| {
+            format!(
+                "{} ({})",
+                month.month,
+                count_noun(month.days_covered(), "day")
+            )
+        })
+        .collect();
+    if partial.is_empty() {
+        return vec![true; months.len()];
+    }
+    let listed = partial.join(", ");
+    if partial.len() == months.len() {
+        notes.push(format!(
+            "every month in range is partial, so avg/peak include them: {listed}"
+        ));
+        return vec![true; months.len()];
+    }
+    notes.push(format!("partial months excluded from avg/peak: {listed}"));
+    months.iter().map(MonthUsage::is_complete).collect()
+}
+
+fn select<'a>(
+    plan_months: &'a [PlanMonth],
+    averaged: &'a [bool],
+) -> impl Iterator<Item = &'a PlanMonth> {
+    plan_months
+        .iter()
+        .zip(averaged)
+        .filter(|(_, counted)| **counted)
+        .map(|(month, _)| month)
+}
+
+fn count_noun(count: impl Into<i64>, noun: &str) -> String {
+    let count = count.into();
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
 fn billed_seats(plan: &Plan, requested: u32, notes: &mut Vec<String>) -> u32 {
     if requested < plan.min_seats {
         notes.push(format!(
-            "seat minimum: {} seats billed (requested {requested})",
-            plan.min_seats
+            "seat minimum: {} billed (requested {requested})",
+            count_noun(plan.min_seats, "seat")
         ));
         return plan.min_seats;
     }
     match plan.max_seats {
         Some(max_seats) if requested > max_seats => {
             notes.push(format!(
-                "seat maximum: {max_seats} seats billed (requested {requested})"
+                "seat maximum: {} billed (requested {requested})",
+                count_noun(max_seats, "seat")
             ));
             max_seats
         }
@@ -294,14 +390,15 @@ fn seat_price(plan: &Plan, billing: Billing, notes: &mut Vec<String>) -> Result<
 }
 
 /// Takes the anchor as a parameter so the estimate and both sensitivity runs share one path.
-fn price_months(terms: &PlanTerms, months: &[MonthUsage], anchor: Money) -> Vec<PlanMonth> {
+/// `None` when a month's total overflows.
+fn price_months(terms: &PlanTerms, months: &[MonthUsage], anchor: Money) -> Option<Vec<PlanMonth>> {
     months
         .iter()
         .map(|month| price_month(terms, month, anchor))
         .collect()
 }
 
-fn price_month(terms: &PlanTerms, month: &MonthUsage, anchor: Money) -> PlanMonth {
+fn price_month(terms: &PlanTerms, month: &MonthUsage, anchor: Money) -> Option<PlanMonth> {
     let plan = terms.plan;
     let interactive = month.interactive.total();
     let headless = month.headless.total();
@@ -323,7 +420,10 @@ fn price_month(terms: &PlanTerms, month: &MonthUsage, anchor: Money) -> PlanMont
         }
     };
     let headless_billed = headless.saturating_sub(credits_applied);
-    PlanMonth {
+    let total = seat_fee
+        .checked_add(extra_usage)?
+        .checked_add(headless_billed)?;
+    Some(PlanMonth {
         month: month.month,
         seats_billed: terms.seats_billed,
         seat_fee,
@@ -333,8 +433,8 @@ fn price_month(terms: &PlanTerms, month: &MonthUsage, anchor: Money) -> PlanMont
         headless_api_equivalent: headless,
         credits_applied,
         headless_billed,
-        total: seat_fee + extra_usage + headless_billed,
-    }
+        total,
+    })
 }
 
 fn credits_pool(plan: &Plan, seats_billed: u32) -> Money {
@@ -345,17 +445,20 @@ fn credits_pool(plan: &Plan, seats_billed: u32) -> Money {
     }
 }
 
-fn average_month(plan_months: &[PlanMonth]) -> Money {
-    let month_count = plan_months.len() as u64;
+fn checked_total<'a>(mut plan_months: impl Iterator<Item = &'a PlanMonth>) -> Option<Money> {
+    plan_months.try_fold(Money::ZERO, |sum, month| sum.checked_add(month.total))
+}
+
+fn average_month(plan_months: &[PlanMonth], averaged: &[bool]) -> Option<Money> {
+    let month_count = averaged.iter().filter(|counted| **counted).count() as u64;
     if month_count == 0 {
-        return Money::ZERO;
+        return Some(Money::ZERO);
     }
-    let total: Money = plan_months.iter().map(|month| month.total).sum();
-    Money::from_nanos(total.nanos() / month_count)
+    let total = checked_total(select(plan_months, averaged))?;
+    Some(Money::from_nanos(total.nanos() / month_count))
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -372,8 +475,11 @@ mod tests {
     }
 
     fn month(year: i16, month: i8, interactive: f64, headless: f64) -> MonthUsage {
+        let first_day = jiff::civil::date(year, month, 1);
         MonthUsage {
             month: YearMonth { year, month },
+            covered_from: first_day,
+            covered_through: first_day.last_of_month(),
             interactive: input_cost(interactive),
             headless: input_cost(headless),
             requests: 10,
@@ -643,6 +749,151 @@ mod tests {
         assert_eq!(api.total, usd(330.0));
         assert_eq!(api.average_month, usd(165.0));
         assert_eq!(api.peak_month, usd(200.0));
+    }
+
+    fn partial(mut usage: MonthUsage, from_day: i8, through_day: i8) -> MonthUsage {
+        usage.covered_from = usage
+            .covered_from
+            .with()
+            .day(from_day)
+            .build()
+            .expect("valid day");
+        usage.covered_through = usage
+            .covered_through
+            .with()
+            .day(through_day)
+            .build()
+            .expect("valid day");
+        usage
+    }
+
+    #[test]
+    fn average_and_peak_skip_a_partial_month_with_a_note() {
+        let months = vec![
+            month(2026, 8, 100.0, 0.0),
+            partial(month(2026, 9, 400.0, 0.0), 1, 20),
+        ];
+        let estimates = estimate(
+            &catalog(),
+            &options(1, Billing::Monthly, CreditsMode::Apply),
+            &months,
+        )
+        .expect("estimate succeeds");
+        let pro = find(&estimates, "pro");
+        assert_eq!(pro.months.len(), 2);
+        assert_eq!(pro.months[1].seat_fee, usd(20.0));
+        assert_eq!(pro.months[1].allowance, usd(60.0));
+        assert_eq!(pro.total, usd(60.0 + 360.0));
+        assert_eq!(pro.average_month, usd(60.0));
+        assert_eq!(pro.peak_month, usd(60.0));
+        assert_eq!(
+            pro.sensitivity,
+            Some(Sensitivity {
+                half_anchor_average_month: usd(90.0),
+                double_anchor_average_month: usd(20.0)
+            })
+        );
+        assert_eq!(
+            pro.notes,
+            vec!["partial months excluded from avg/peak: 2026-09 (20 days)".to_string()]
+        );
+        let api = find(&estimates, "api");
+        assert_eq!(api.total, usd(500.0));
+        assert_eq!(api.average_month, usd(100.0));
+        assert_eq!(api.peak_month, usd(100.0));
+    }
+
+    #[test]
+    fn every_month_partial_falls_back_to_all_months_with_a_note() {
+        let months = vec![
+            partial(month(2026, 9, 100.0, 0.0), 30, 30),
+            partial(month(2026, 10, 300.0, 0.0), 1, 20),
+        ];
+        let estimates = estimate(
+            &catalog(),
+            &options(1, Billing::Monthly, CreditsMode::Apply),
+            &months,
+        )
+        .expect("estimate succeeds");
+        let api = find(&estimates, "api");
+        assert_eq!(api.total, usd(400.0));
+        assert_eq!(api.average_month, usd(200.0));
+        assert_eq!(api.peak_month, usd(300.0));
+        assert_eq!(
+            api.notes,
+            vec![
+                "every month in range is partial, so avg/peak include them: 2026-09 (1 day), 2026-10 (20 days)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn month_completeness_follows_the_covered_days() {
+        let full = month(2026, 2, 0.0, 0.0);
+        assert!(full.is_complete());
+        assert_eq!(full.days_covered(), 28);
+        let late_start = partial(month(2026, 2, 0.0, 0.0), 2, 28);
+        assert!(!late_start.is_complete());
+        assert_eq!(late_start.days_covered(), 27);
+        let early_end = partial(month(2026, 2, 0.0, 0.0), 1, 27);
+        assert!(!early_end.is_complete());
+    }
+
+    #[test]
+    fn overflowing_plan_total_is_an_error() {
+        let expensive = Plan {
+            seat_monthly: Some(Money::from_nanos(u64::MAX / 2)),
+            ..base_plan("expensive", PlanKind::SeatPlusUsage)
+        };
+        let single = PlanCatalog {
+            allowance_anchor: usd(60.0),
+            plans: vec![expensive],
+        };
+        let months = vec![
+            month(2026, 8, 0.0, 0.0),
+            month(2026, 9, 0.0, 0.0),
+            month(2026, 10, 0.0, 0.0),
+        ];
+        let result = estimate(
+            &single,
+            &options(1, Billing::Monthly, CreditsMode::Apply),
+            &months,
+        );
+        assert_eq!(
+            result,
+            Err(PlanError::Overflow {
+                plan: "expensive".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn plan_kind_labels_match_the_price_list_file() {
+        assert_eq!(PlanKind::PayAsYouGo.label(), "pay_as_you_go");
+        assert_eq!(PlanKind::Subscription.label(), "subscription");
+        assert_eq!(PlanKind::SeatPlusUsage.label(), "seat_plus_usage");
+    }
+
+    #[test]
+    fn year_month_serializes_as_a_string() {
+        let value = serde_json::to_value(YearMonth {
+            year: 2026,
+            month: 9,
+        })
+        .expect("serializes");
+        assert_eq!(value, serde_json::json!("2026-09"));
+    }
+
+    #[test]
+    fn seat_cap_note_uses_the_singular_for_one_seat() {
+        let estimates = run(3, Billing::Monthly, CreditsMode::Apply);
+        assert_eq!(
+            find(&estimates, "pro").notes,
+            vec!["seat maximum: 1 seat billed (requested 3)".to_string()]
+        );
+        assert_eq!(find(&estimates, "pro").seats_billed, 1);
+        assert_eq!(find(&estimates, "team_standard").seats_billed, 3);
     }
 
     #[test]

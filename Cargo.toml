@@ -2,7 +2,7 @@
 name = "tokentab"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Replays local AI coding transcripts through a price list and compares what they would have cost on each plan"
 license = "MIT"
 repository = "https://github.com/frits-v/tokentab"
@@ -26,4 +26,4 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 unwrap_used = "deny"
-expect_used = "warn"
+expect_used = "allow"

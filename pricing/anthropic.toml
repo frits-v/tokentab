@@ -116,7 +116,7 @@ tiers = [{ prompt_tokens_over = 0, input = 0.80, output = 4.0, cache_read = 0.08
 # plan's allowance is `allowance_anchor_usd * allowance_multiple`. The report prints
 # the same numbers with the anchor halved and doubled.
 #
-# API credits (added October 2026) are monthly Claude Platform credits bundled with
+# API credits are monthly Claude Platform credits bundled with
 # Max and Team. They cover the API, the Agent SDK and headless `claude -p` runs, not
 # interactive Claude Code, so the estimate applies them to SDK-entrypoint usage only.
 

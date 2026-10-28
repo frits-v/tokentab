@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use walkdir::WalkDir;
 
 use super::record::{LineKind, TranscriptLine, Usage};
@@ -14,20 +14,25 @@ use crate::domain::usage::{
 };
 use crate::ports::usage_source::SourceError;
 
-/// Walks `projects_dir` recursively for `*.jsonl`, parses each line, keeps assistant
-/// lines with usage, dedupes by `message.id` keeping the line with the highest
-/// `output_tokens` (the last streamed block), applies `filter`, and fills `ScanStats`
-/// so the report can state what was examined. The project name is the record's `cwd`,
-/// falling back to the transcript's parent directory name.
+/// Walks `projects_dir` recursively for `*.jsonl`, following symlinks, parses each line,
+/// keeps assistant lines with usage, dedupes by `message.id` keeping the line with the
+/// highest `output_tokens` (the last streamed block), applies `filter`, and fills
+/// `ScanStats` so the report can state what was examined. The project name is the
+/// record's `cwd`, falling back to the transcript's parent directory name.
 ///
-/// Errors only when `projects_dir` itself cannot be read; a single unreadable file
-/// is counted in `files_unreadable` and skipped.
+/// Errors only when `projects_dir` itself cannot be read; a single unreadable file,
+/// or a `*.jsonl` that is not a regular file, is counted in `files_unreadable` and skipped.
 pub fn scan_directory(projects_dir: &Path, filter: &ScanFilter) -> Result<Scan, SourceError> {
     std::fs::read_dir(projects_dir).map_err(|error| unreadable(projects_dir, &error))?;
 
+    let plausible = PlausibleTimes::ending_tomorrow();
     let mut stats = ScanStats::default();
     let mut latest_by_message: BTreeMap<String, UsageEvent> = BTreeMap::new();
-    for entry in WalkDir::new(projects_dir).sort_by_file_name() {
+    // Loops through symlinked directories come back as errors and are counted below.
+    for entry in WalkDir::new(projects_dir)
+        .follow_links(true)
+        .sort_by_file_name()
+    {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) if error.depth() == 0 => return Err(unreadable(projects_dir, &error)),
@@ -41,7 +46,11 @@ pub fn scan_directory(projects_dir: &Path, filter: &ScanFilter) -> Result<Scan, 
             continue;
         }
         stats.files_seen += 1;
-        scan_file(entry.path(), &mut stats, &mut latest_by_message);
+        if !entry.file_type().is_file() {
+            stats.files_unreadable += 1;
+            continue;
+        }
+        scan_file(entry.path(), &plausible, &mut stats, &mut latest_by_message);
     }
 
     stats.duplicates_collapsed = stats.events_before_dedup - latest_by_message.len() as u64;
@@ -70,8 +79,46 @@ fn unreadable(path: &Path, error: &dyn std::error::Error) -> SourceError {
     }
 }
 
+/// Far above any real transcript line, and small enough to hold in memory.
+const MAX_LINE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+enum LineRead {
+    Eof,
+    Line,
+    /// Longer than the cap; the rest of it was skipped and `buffer` is empty.
+    TooLong,
+}
+
+/// Reads one line into `buffer`, holding at most `cap` bytes of it in memory.
+fn read_line_capped(
+    reader: &mut impl BufRead,
+    buffer: &mut Vec<u8>,
+    cap: u64,
+) -> io::Result<LineRead> {
+    buffer.clear();
+    let read = reader.by_ref().take(cap).read_until(b'\n', buffer)?;
+    if read == 0 {
+        return Ok(LineRead::Eof);
+    }
+    if buffer.ends_with(b"\n") || (read as u64) < cap {
+        return Ok(LineRead::Line);
+    }
+    // Ends at the next newline or at the end of the file; only regular files get here.
+    loop {
+        buffer.clear();
+        let skipped = reader.by_ref().take(cap).read_until(b'\n', buffer)?;
+        if skipped == 0 || buffer.ends_with(b"\n") {
+            break;
+        }
+    }
+    buffer.clear();
+    Ok(LineRead::TooLong)
+}
+
 fn scan_file(
     path: &Path,
+    plausible: &PlausibleTimes,
     stats: &mut ScanStats,
     latest_by_message: &mut BTreeMap<String, UsageEvent>,
 ) {
@@ -83,14 +130,22 @@ fn scan_file(
     let mut buffer = Vec::new();
     let mut line_number: u64 = 0;
     loop {
-        buffer.clear();
-        match reader.read_until(b'\n', &mut buffer) {
-            Ok(0) => break,
-            Ok(_) => {}
+        let read = match read_line_capped(&mut reader, &mut buffer, MAX_LINE_BYTES) {
+            Ok(read) => read,
             // Lines already read from this file stay counted; the rest of it is lost.
             Err(_) => {
                 stats.files_unreadable += 1;
                 break;
+            }
+        };
+        match read {
+            LineRead::Eof => break,
+            LineRead::Line => {}
+            LineRead::TooLong => {
+                line_number += 1;
+                stats.lines_read += 1;
+                stats.lines_unparseable += 1;
+                continue;
             }
         }
         line_number += 1;
@@ -107,12 +162,22 @@ fn scan_file(
         match record.classify() {
             LineKind::AssistantWithUsage(record) => {
                 stats.assistant_lines += 1;
-                let Some(event) = build_event(record, path, line_number) else {
+                let Some((event, split_mismatch)) =
+                    build_event(record, path, line_number, plausible)
+                else {
                     stats.lines_unparseable += 1;
                     continue;
                 };
+                // A billed model with nothing to bill is a usage object that says nothing.
+                if event.tokens.is_empty() && matches!(event.model, ModelName::Named(_)) {
+                    stats.assistant_lines_without_usage += 1;
+                    continue;
+                }
+                if split_mismatch {
+                    stats.cache_split_mismatches += 1;
+                }
                 stats.events_before_dedup += 1;
-                keep_latest(latest_by_message, event);
+                keep_latest(latest_by_message, event, stats);
             }
             LineKind::AssistantWithoutUsage => {
                 stats.assistant_lines += 1;
@@ -127,12 +192,23 @@ fn scan_file(
 }
 
 /// Message ids are globally unique, so dedup spans files.
-fn keep_latest(latest_by_message: &mut BTreeMap<String, UsageEvent>, event: UsageEvent) {
+fn keep_latest(
+    latest_by_message: &mut BTreeMap<String, UsageEvent>,
+    event: UsageEvent,
+    stats: &mut ScanStats,
+) {
     match latest_by_message.entry(event.message_id.clone()) {
         Entry::Vacant(slot) => {
             slot.insert(event);
         }
         Entry::Occupied(mut slot) => {
+            let kept = &slot.get().tokens;
+            if event.tokens.input != kept.input
+                || event.tokens.cache_read != kept.cache_read
+                || event.tokens.cache_write() != kept.cache_write()
+            {
+                stats.conflicting_duplicates += 1;
+            }
             if event.tokens.output >= slot.get().tokens.output {
                 slot.insert(event);
             }
@@ -144,11 +220,47 @@ fn keep_latest(latest_by_message: &mut BTreeMap<String, UsageEvent>, event: Usag
 /// that no single request can overflow u64 nanodollars at any price the loader accepts.
 const MAX_TOKENS_PER_FIELD: u64 = 100_000_000;
 
-/// None when the timestamp is missing or not RFC 3339, or a token count is above
-/// `MAX_TOKENS_PER_FIELD`; the caller counts the line as unparseable.
-fn build_event(record: &TranscriptLine, path: &Path, line_number: u64) -> Option<UsageEvent> {
+/// Transcripts cannot predate Claude Code. A timestamp outside this window would open a
+/// billing month of its own, so the line counts as unparseable instead.
+struct PlausibleTimes {
+    earliest: Timestamp,
+    latest: Timestamp,
+}
+
+impl PlausibleTimes {
+    /// 2023-01-01T00:00:00Z.
+    const EARLIEST: Timestamp = Timestamp::constant(1_672_531_200, 0);
+
+    /// One day of slack after now for clock skew between machines.
+    fn ending_tomorrow() -> PlausibleTimes {
+        let now = Timestamp::now();
+        PlausibleTimes {
+            earliest: PlausibleTimes::EARLIEST,
+            latest: now
+                .checked_add(SignedDuration::from_hours(24))
+                .unwrap_or(now),
+        }
+    }
+
+    fn contains(&self, timestamp: Timestamp) -> bool {
+        self.earliest <= timestamp && timestamp <= self.latest
+    }
+}
+
+/// None when the timestamp is missing, not RFC 3339 or outside `plausible`, or a token
+/// count is above `MAX_TOKENS_PER_FIELD`; the caller counts the line as unparseable.
+/// The flag is true when the cache-write split disagreed with its total.
+fn build_event(
+    record: &TranscriptLine,
+    path: &Path,
+    line_number: u64,
+    plausible: &PlausibleTimes,
+) -> Option<(UsageEvent, bool)> {
     let timestamp: Timestamp = record.timestamp.as_deref()?.parse().ok()?;
-    let tokens = record.usage().map(token_usage).unwrap_or_default();
+    if !plausible.contains(timestamp) {
+        return None;
+    }
+    let (tokens, split_mismatch) = record.usage().map(token_usage).unwrap_or_default();
     if !within_bounds(&tokens) {
         return None;
     }
@@ -170,7 +282,7 @@ fn build_event(record: &TranscriptLine, path: &Path, line_number: u64) -> Option
         .map(str::to_string)
         .unwrap_or_else(|| parent_directory_name(path));
 
-    Some(UsageEvent {
+    let event = UsageEvent {
         session_id,
         message_id,
         timestamp,
@@ -179,7 +291,8 @@ fn build_event(record: &TranscriptLine, path: &Path, line_number: u64) -> Option
         sidechain: record.is_sidechain.unwrap_or(false),
         project,
         tokens,
-    })
+    };
+    Some((event, split_mismatch))
 }
 
 fn within_bounds(tokens: &TokenUsage) -> bool {
@@ -205,21 +318,35 @@ fn parent_directory_name(path: &Path) -> String {
     }
 }
 
-fn token_usage(usage: &Usage) -> TokenUsage {
-    let (cache_write_5m, cache_write_1h) = match &usage.cache_creation {
-        Some(split) => (
-            split.ephemeral_5m_input_tokens.unwrap_or(0),
-            split.ephemeral_1h_input_tokens.unwrap_or(0),
-        ),
-        None => (usage.cache_creation_input_tokens.unwrap_or(0), 0),
+/// A `cache_creation` split with at least one band set says how the writes divide
+/// between the 5-minute and 1-hour rates. Whatever part of `cache_creation_input_tokens`
+/// the split does not cover is priced as 5-minute writes, the cheaper band, as is the
+/// whole total when there is no usable split. The flag is true when a split and its
+/// total disagree.
+fn token_usage(usage: &Usage) -> (TokenUsage, bool) {
+    let total = usage.cache_creation_input_tokens.unwrap_or(0);
+    let split = usage.cache_creation.as_ref().filter(|split| {
+        split.ephemeral_5m_input_tokens.is_some() || split.ephemeral_1h_input_tokens.is_some()
+    });
+    let (cache_write_5m, cache_write_1h, mismatch) = match split {
+        Some(split) => {
+            let split_5m = split.ephemeral_5m_input_tokens.unwrap_or(0);
+            let split_1h = split.ephemeral_1h_input_tokens.unwrap_or(0);
+            let split_sum = split_5m.saturating_add(split_1h);
+            let mismatch = usage.cache_creation_input_tokens.is_some() && split_sum != total;
+            let remainder = total.saturating_sub(split_sum);
+            (split_5m.saturating_add(remainder), split_1h, mismatch)
+        }
+        None => (total, 0, false),
     };
-    TokenUsage {
+    let tokens = TokenUsage {
         input: usage.input_tokens.unwrap_or(0),
         output: usage.output_tokens.unwrap_or(0),
         cache_read: usage.cache_read_input_tokens.unwrap_or(0),
         cache_write_5m,
         cache_write_1h,
-    }
+    };
+    (tokens, mismatch)
 }
 
 #[cfg(test)]
@@ -442,26 +569,186 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn cache_creation_split_wins_over_total() {
-        let usage = Usage {
+    fn cache_usage(total: Option<u64>, split: Option<CacheCreation>) -> Usage {
+        Usage {
             input_tokens: Some(3),
             output_tokens: None,
             cache_read_input_tokens: Some(9),
-            cache_creation_input_tokens: Some(500),
-            cache_creation: Some(CacheCreation {
+            cache_creation_input_tokens: total,
+            cache_creation: split,
+        }
+    }
+
+    #[test]
+    fn partial_cache_split_prices_the_remainder_as_five_minute_writes() {
+        let usage = cache_usage(
+            Some(500),
+            Some(CacheCreation {
                 ephemeral_5m_input_tokens: Some(200),
                 ephemeral_1h_input_tokens: None,
             }),
-        };
+        );
         let expected = TokenUsage {
             input: 3,
             output: 0,
             cache_read: 9,
-            cache_write_5m: 200,
+            cache_write_5m: 500,
             cache_write_1h: 0,
         };
-        assert_eq!(token_usage(&usage), expected);
+        assert_eq!(token_usage(&usage), (expected, true));
+    }
+
+    #[test]
+    fn empty_cache_split_falls_back_to_the_total() {
+        let usage = cache_usage(
+            Some(500),
+            Some(CacheCreation {
+                ephemeral_5m_input_tokens: None,
+                ephemeral_1h_input_tokens: None,
+            }),
+        );
+        let (tokens, mismatch) = token_usage(&usage);
+        assert_eq!(tokens.cache_write_5m, 500);
+        assert_eq!(tokens.cache_write_1h, 0);
+        assert!(!mismatch);
+    }
+
+    #[test]
+    fn matching_cache_split_is_used_as_is() {
+        let usage = cache_usage(
+            Some(500),
+            Some(CacheCreation {
+                ephemeral_5m_input_tokens: Some(100),
+                ephemeral_1h_input_tokens: Some(400),
+            }),
+        );
+        let (tokens, mismatch) = token_usage(&usage);
+        assert_eq!((tokens.cache_write_5m, tokens.cache_write_1h), (100, 400));
+        assert!(!mismatch);
+    }
+
+    #[test]
+    fn advisor_line_with_a_short_split_keeps_every_cache_write() -> TestResult {
+        let projects = TempProjects::new("advisor")?;
+        let line = r#"{"type":"assistant","uuid":"u-adv","timestamp":"2026-10-01T00:00:00Z","sessionId":"s","cwd":"/work","entrypoint":"cli","message":{"id":"msg_adv","model":"claude-opus-5-5","usage":{"input_tokens":12,"cache_creation_input_tokens":7242,"cache_read_input_tokens":30110,"output_tokens":845,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5972},"iterations":[{"type":"message"},{"type":"advisor_message"},{"type":"message"}]}}}"#;
+        projects.write("p/s.jsonl", &format!("{line}\n"))?;
+        let scan = projects.scan()?;
+        assert_eq!(scan.stats.lines_unparseable, 0);
+        assert_eq!(scan.stats.cache_split_mismatches, 1);
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].tokens.cache_write_1h, 5972);
+        assert_eq!(scan.events[0].tokens.cache_write_5m, 1270);
+        Ok(())
+    }
+
+    #[test]
+    fn timestamp_outside_the_plausible_window_is_unparseable() -> TestResult {
+        let projects = TempProjects::new("plausible")?;
+        let ancient = assistant("msg_a", "0001-01-01T00:00:00Z", 1);
+        let before_launch = assistant("msg_b", "2022-12-31T23:59:59Z", 1);
+        let future = assistant("msg_c", "2999-01-01T00:00:00Z", 1);
+        let earliest = assistant("msg_d", "2023-01-01T00:00:00Z", 1);
+        projects.write(
+            "p/s.jsonl",
+            &format!("{ancient}\n{before_launch}\n{future}\n{earliest}\n"),
+        )?;
+        let scan = projects.scan()?;
+        assert_eq!(scan.stats.lines_unparseable, 3);
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].message_id, "msg_d");
+        Ok(())
+    }
+
+    #[test]
+    fn named_model_with_all_zero_usage_is_not_a_request() -> TestResult {
+        let projects = TempProjects::new("zero")?;
+        let empty = r#"{"type":"assistant","timestamp":"2026-10-01T00:00:00Z","message":{"id":"m1","model":"claude-opus-5-5","usage":{}}}"#;
+        let nulls = r#"{"type":"assistant","timestamp":"2026-10-01T00:00:01Z","message":{"id":"m2","model":"claude-opus-5-5","usage":{"input_tokens":null,"output_tokens":null}}}"#;
+        let synthetic = r#"{"type":"assistant","timestamp":"2026-10-01T00:00:02Z","message":{"id":"m3","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}}}"#;
+        projects.write("p/s.jsonl", &format!("{empty}\n{nulls}\n{synthetic}\n"))?;
+        let scan = projects.scan()?;
+        assert_eq!(scan.stats.assistant_lines, 3);
+        assert_eq!(scan.stats.assistant_lines_without_usage, 2);
+        assert_eq!(scan.stats.events, 1);
+        assert_eq!(scan.events[0].model, ModelName::Synthetic);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_with_different_input_counts_as_conflicting() -> TestResult {
+        let projects = TempProjects::new("conflict")?;
+        let streamed_a = assistant("msg_a", "2026-10-01T00:00:00Z", 3);
+        let streamed_b = assistant("msg_a", "2026-10-01T00:00:01Z", 9);
+        let other = r#"{"type":"assistant","timestamp":"2026-10-01T00:00:02Z","message":{"id":"msg_a","model":"claude-opus-5-5","usage":{"input_tokens":500,"output_tokens":9}}}"#;
+        projects.write(
+            "p/s.jsonl",
+            &format!("{streamed_a}\n{streamed_b}\n{other}\n"),
+        )?;
+        let scan = projects.scan()?;
+        assert_eq!(scan.stats.duplicates_collapsed, 2);
+        assert_eq!(scan.stats.conflicting_duplicates, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn capped_reader_skips_an_oversized_line() -> Result<(), io::Error> {
+        let mut reader = io::Cursor::new(b"short\nthis line is far too long\nnext\ntail".to_vec());
+        let mut buffer = Vec::new();
+        assert_eq!(
+            read_line_capped(&mut reader, &mut buffer, 8)?,
+            LineRead::Line
+        );
+        assert_eq!(buffer, b"short\n");
+        assert_eq!(
+            read_line_capped(&mut reader, &mut buffer, 8)?,
+            LineRead::TooLong
+        );
+        assert!(buffer.is_empty());
+        assert_eq!(
+            read_line_capped(&mut reader, &mut buffer, 8)?,
+            LineRead::Line
+        );
+        assert_eq!(buffer, b"next\n");
+        assert_eq!(
+            read_line_capped(&mut reader, &mut buffer, 8)?,
+            LineRead::Line
+        );
+        assert_eq!(buffer, b"tail");
+        assert_eq!(
+            read_line_capped(&mut reader, &mut buffer, 8)?,
+            LineRead::Eof
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_project_directory_is_scanned() -> TestResult {
+        let projects = TempProjects::new("linked")?;
+        let elsewhere = TempProjects::new("linked-target")?;
+        elsewhere.write("s.jsonl", &assistant("msg_a", "2026-10-01T00:00:00Z", 1))?;
+        std::os::unix::fs::symlink(&elsewhere.root, projects.root.join("linked"))?;
+        let scan = projects.scan()?;
+        assert_eq!(scan.stats.files_seen, 1);
+        assert_eq!(scan.events.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_that_is_not_a_regular_file_is_unreadable() -> TestResult {
+        let projects = TempProjects::new("device")?;
+        projects.write(
+            "p/real.jsonl",
+            &assistant("msg_a", "2026-10-01T00:00:00Z", 1),
+        )?;
+        std::os::unix::fs::symlink("/dev/zero", projects.root.join("p").join("zero.jsonl"))?;
+        let scan = projects.scan()?;
+        assert_eq!(scan.stats.files_seen, 2);
+        assert_eq!(scan.stats.files_unreadable, 1);
+        assert_eq!(scan.stats.lines_read, 1);
+        assert_eq!(scan.events.len(), 1);
+        Ok(())
     }
 
     #[test]
@@ -480,6 +767,6 @@ mod tests {
             cache_write_5m: 500,
             cache_write_1h: 0,
         };
-        assert_eq!(token_usage(&usage), expected);
+        assert_eq!(token_usage(&usage), (expected, false));
     }
 }

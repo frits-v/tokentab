@@ -27,7 +27,9 @@ impl ModelName {
 
 fn strip_snapshot_suffix(name: &str) -> &str {
     match name.rsplit_once('-') {
-        Some((stem, suffix)) if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit()) => {
+        Some((stem, suffix))
+            if suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
             stem
         }
         _ => name,
@@ -51,7 +53,7 @@ impl Entrypoint {
         match raw.map(str::trim) {
             None | Some("") => Entrypoint::Missing,
             Some("cli") => Entrypoint::Interactive,
-            Some("sdk-cli") | Some("sdk-py") | Some("sdk-ts") => Entrypoint::Sdk,
+            Some("sdk-cli") | Some("sdk-py") => Entrypoint::Sdk,
             Some("claude-desktop") => Entrypoint::Desktop,
             Some(other) => Entrypoint::Unrecognised(other.to_string()),
         }
@@ -138,6 +140,12 @@ pub struct ScanStats {
     pub assistant_lines_without_usage: u64,
     pub events_before_dedup: u64,
     pub duplicates_collapsed: u64,
+    /// Duplicates whose input or cache counts differed from the line kept, so the
+    /// collapsed line may have carried cost the kept one does not.
+    pub conflicting_duplicates: u64,
+    /// Lines whose `cache_creation` split did not add up to `cache_creation_input_tokens`;
+    /// the difference is priced as 5-minute writes.
+    pub cache_split_mismatches: u64,
     pub events_filtered_out: u64,
     pub events: u64,
     /// Other record types seen, by `type` value, so a changed format shows up as a count rather than silence.
@@ -222,6 +230,11 @@ mod tests {
             Entrypoint::Desktop
         );
         assert_eq!(Entrypoint::decode(None), Entrypoint::Missing);
+        assert_eq!(Entrypoint::decode(Some("")), Entrypoint::Missing);
+        assert_eq!(
+            Entrypoint::decode(Some("sdk-ts")),
+            Entrypoint::Unrecognised("sdk-ts".into())
+        );
         assert_eq!(
             Entrypoint::decode(Some("vscode-2030")),
             Entrypoint::Unrecognised("vscode-2030".into())

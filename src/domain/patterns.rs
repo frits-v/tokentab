@@ -16,8 +16,8 @@ pub struct PricedEvent {
     pub cost: Cost,
 }
 
-/// The most expensive window of a fixed length anywhere in the range.
-/// Plan limits are enforced per rolling window, so this is where a plan would have throttled.
+/// The most expensive window of a fixed length anywhere in the range: the heaviest
+/// stretch of usage, which is where a rolling plan limit would bind first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WindowPeak {
     pub start: Timestamp,
@@ -190,22 +190,18 @@ fn per_model(events: &[PricedEvent]) -> Vec<ModelTotals> {
 }
 
 fn per_entrypoint(events: &[PricedEvent]) -> Vec<EntrypointTotals> {
-    let mut totals: BTreeMap<&str, (u64, Money)> = BTreeMap::new();
+    let mut totals: BTreeMap<&str, EntrypointTotals> = BTreeMap::new();
     for priced in events {
-        let entry = totals
-            .entry(priced.event.entrypoint.label())
-            .or_insert((0, Money::ZERO));
-        entry.0 += 1;
-        entry.1 += priced.cost.total();
-    }
-    let mut rows: Vec<EntrypointTotals> = totals
-        .into_iter()
-        .map(|(label, (requests, cost))| EntrypointTotals {
+        let label = priced.event.entrypoint.label();
+        let entry = totals.entry(label).or_insert_with(|| EntrypointTotals {
             entrypoint: label.to_string(),
-            requests,
-            cost,
-        })
-        .collect();
+            requests: 0,
+            cost: Money::ZERO,
+        });
+        entry.requests += 1;
+        entry.cost += priced.cost.total();
+    }
+    let mut rows: Vec<EntrypointTotals> = totals.into_values().collect();
     rows.sort_by(|left, right| {
         right
             .cost
@@ -216,22 +212,18 @@ fn per_entrypoint(events: &[PricedEvent]) -> Vec<EntrypointTotals> {
 }
 
 fn per_project(events: &[PricedEvent]) -> Vec<ProjectTotals> {
-    let mut totals: BTreeMap<&str, (u64, Money)> = BTreeMap::new();
+    let mut totals: BTreeMap<&str, ProjectTotals> = BTreeMap::new();
     for priced in events {
-        let entry = totals
-            .entry(priced.event.project.as_str())
-            .or_insert((0, Money::ZERO));
-        entry.0 += 1;
-        entry.1 += priced.cost.total();
-    }
-    let mut rows: Vec<ProjectTotals> = totals
-        .into_iter()
-        .map(|(project, (requests, cost))| ProjectTotals {
+        let project = priced.event.project.as_str();
+        let entry = totals.entry(project).or_insert_with(|| ProjectTotals {
             project: project.to_string(),
-            requests,
-            cost,
-        })
-        .collect();
+            requests: 0,
+            cost: Money::ZERO,
+        });
+        entry.requests += 1;
+        entry.cost += priced.cost.total();
+    }
+    let mut rows: Vec<ProjectTotals> = totals.into_values().collect();
     rows.sort_by(|left, right| {
         right
             .cost
@@ -269,7 +261,6 @@ fn cache_stats(events: &[PricedEvent]) -> CacheStats {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::domain::usage::{Entrypoint, ModelName};

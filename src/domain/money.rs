@@ -40,6 +40,11 @@ impl Money {
         self.0 == 0
     }
 
+    /// `None` when the sum would not fit in u64 nanodollars.
+    pub fn checked_add(self, other: Money) -> Option<Money> {
+        self.0.checked_add(other.0).map(Money)
+    }
+
     pub fn saturating_sub(self, other: Money) -> Money {
         Money(self.0.saturating_sub(other.0))
     }
@@ -91,16 +96,21 @@ impl fmt::Display for Money {
         let cents = (self.0 + NANOS_PER_DOLLAR / 200) / (NANOS_PER_DOLLAR / 100);
         let dollars = cents / 100;
         let remainder = cents % 100;
-        let digits = dollars.to_string();
-        let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-        for (index, digit) in digits.chars().enumerate() {
-            if index > 0 && (digits.len() - index) % 3 == 0 {
-                grouped.push(',');
-            }
-            grouped.push(digit);
-        }
+        let grouped = group_thousands(&dollars.to_string());
         f.pad(&format!("${grouped}.{remainder:02}"))
     }
+}
+
+/// Inserts a comma every three digits from the right: `1234567` becomes `1,234,567`.
+pub fn group_thousands(digits: &str) -> String {
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 impl Serialize for Money {
@@ -177,6 +187,26 @@ mod tests {
         assert_eq!(Money::from_usd(0.004).to_string(), "$0.00");
         assert_eq!(Money::from_usd(1_000_000.0).to_string(), "$1,000,000.00");
         assert_eq!(Money::ZERO.to_string(), "$0.00");
+    }
+
+    #[test]
+    fn group_thousands_inserts_a_comma_every_three_digits() {
+        assert_eq!(group_thousands("0"), "0");
+        assert_eq!(group_thousands("999"), "999");
+        assert_eq!(group_thousands("1000"), "1,000");
+        assert_eq!(group_thousands("9876543210"), "9,876,543,210");
+    }
+
+    #[test]
+    fn checked_add_reports_overflow() {
+        assert_eq!(
+            Money::from_nanos(2).checked_add(Money::from_nanos(3)),
+            Some(Money::from_nanos(5))
+        );
+        assert_eq!(
+            Money::from_nanos(u64::MAX).checked_add(Money::from_nanos(1)),
+            None
+        );
     }
 
     #[test]

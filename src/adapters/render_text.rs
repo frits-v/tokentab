@@ -2,10 +2,12 @@
 //!
 //! Sections in order:
 //! 1. Scan: source, files seen, lines read, unparseable lines, assistant lines,
-//!    requests before dedup, duplicates collapsed, filtered out, priced, unpriced by reason.
-//! 2. Usage by month: month, requests, interactive API-equivalent, headless API-equivalent, total.
-//! 3. Plans: one row per plan with average month, peak month, total over the range,
-//!    then per-plan notes and the sensitivity line (anchor halved / doubled).
+//!    requests before dedup, duplicates collapsed (and how many conflicted), cache split
+//!    mismatches, filtered out, priced, unpriced by reason.
+//! 2. Usage by month: month, requests, interactive API-equivalent, headless API-equivalent,
+//!    total, unpriced; then the unpriced requests that fall in no listed month.
+//! 3. Plans: one row per plan with seats billed, average month, peak month, total over
+//!    the range, then per-plan notes and the sensitivity line (anchor halved / doubled).
 //! 4. Patterns: peak 5-hour window and peak 7-day window (or "unavailable at day
 //!    granularity"), active days, sessions, sidechain share, per-model table with
 //!    tokens and cost, per-entrypoint table, top projects, cache stats with the
@@ -16,7 +18,7 @@ use std::io::{self, Write};
 
 use jiff::Timestamp;
 
-use crate::domain::money::Money;
+use crate::domain::money::{Money, group_thousands};
 use crate::domain::plans::{Billing, CreditsMode};
 use crate::domain::report::Report;
 use crate::domain::usage::Granularity;
@@ -100,6 +102,18 @@ fn render_scan(report: &Report, out: &mut dyn Write) -> io::Result<()> {
     )?;
     key_value(
         out,
+        4,
+        "with different input or cache",
+        &thousands(stats.conflicting_duplicates),
+    )?;
+    key_value(
+        out,
+        2,
+        "cache split mismatches",
+        &thousands(stats.cache_split_mismatches),
+    )?;
+    key_value(
+        out,
         2,
         "filtered out",
         &thousands(stats.events_filtered_out),
@@ -168,15 +182,24 @@ fn render_months(report: &Report, out: &mut dyn Write) -> io::Result<()> {
         headless.to_string(),
         (interactive + headless).to_string(),
         thousands(unpriced)
-    )
+    )?;
+    let outside = report.unpriced.total().saturating_sub(unpriced);
+    if outside > 0 {
+        writeln!(
+            out,
+            "  {} unpriced requests fall in months without priced usage and are not listed",
+            thousands(outside)
+        )?;
+    }
+    Ok(())
 }
 
 fn render_plans(report: &Report, out: &mut dyn Write) -> io::Result<()> {
     heading(out, "Plans")?;
     writeln!(
         out,
-        "  {:<28} {:>16} {:>16} {:>16}",
-        "plan", "avg/month", "peak month", "total"
+        "  {:<28} {:>6} {:>16} {:>16} {:>16}",
+        "plan", "seats", "avg/month", "peak month", "total"
     )?;
     if report.plans.is_empty() {
         writeln!(out, "  no plans in the catalog")?;
@@ -184,13 +207,15 @@ fn render_plans(report: &Report, out: &mut dyn Write) -> io::Result<()> {
     for plan in &report.plans {
         writeln!(
             out,
-            "  {:<28} {:>16} {:>16} {:>16}",
+            "  {:<28} {:>6} {:>16} {:>16} {:>16}",
             fit_head(&plain(&plan.plan_name), 28),
+            thousands(u64::from(plan.seats_billed)),
             plan.average_month.to_string(),
             plan.peak_month.to_string(),
             plan.total.to_string()
         )?;
     }
+    render_plan_months(report, out)?;
     for plan in &report.plans {
         if plan.notes.is_empty() && plan.sensitivity.is_none() {
             continue;
@@ -211,6 +236,52 @@ fn render_plans(report: &Report, out: &mut dyn Write) -> io::Result<()> {
                 sensitivity.half_anchor_average_month, sensitivity.double_anchor_average_month
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Months down, plans across: the variation the average and peak columns flatten.
+fn render_plan_months(report: &Report, out: &mut dyn Write) -> io::Result<()> {
+    const MONTH_WIDTH: usize = 7;
+    const COLUMN_WIDTH: usize = 12;
+    let plans = &report.plans;
+    if plans.is_empty() {
+        return Ok(());
+    }
+    if 2 + MONTH_WIDTH + (COLUMN_WIDTH + 1) * plans.len() > MAX_WIDTH {
+        writeln!(
+            out,
+            "  per-month plan costs omitted: {} plans do not fit in {} columns; use --format json",
+            plans.len(),
+            MAX_WIDTH
+        )?;
+        return Ok(());
+    }
+    writeln!(out)?;
+    write!(out, "  {:<MONTH_WIDTH$}", "month")?;
+    for plan in plans {
+        let header: String = plain(&plan.plan_id).chars().take(COLUMN_WIDTH).collect();
+        write!(out, " {header:>COLUMN_WIDTH$}")?;
+    }
+    writeln!(out)?;
+    let month_count = plans
+        .iter()
+        .map(|plan| plan.months.len())
+        .max()
+        .unwrap_or(0);
+    for index in 0..month_count {
+        let Some(month) = plans.iter().find_map(|plan| plan.months.get(index)) else {
+            break;
+        };
+        write!(out, "  {:<MONTH_WIDTH$}", month.month.to_string())?;
+        for plan in plans {
+            let cell = match plan.months.get(index) {
+                Some(plan_month) => plan_month.total.to_string(),
+                None => "-".to_string(),
+            };
+            write!(out, " {:>COLUMN_WIDTH$}", cell)?;
+        }
+        writeln!(out)?;
     }
     Ok(())
 }
@@ -409,15 +480,7 @@ fn granularity_label(granularity: Granularity) -> &'static str {
 }
 
 fn thousands(count: u64) -> String {
-    let digits = count.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
+    group_thousands(&count.to_string())
 }
 
 fn percent(fraction: f64) -> String {
@@ -492,7 +555,6 @@ fn wrap(out: &mut dyn Write, indent: usize, text: &str) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::domain::plans::EstimateOptions;
@@ -511,7 +573,9 @@ mod tests {
         lines
             .windows(2)
             .filter(|pair| {
-                !pair[0].is_empty() && pair[1].chars().all(|c| c == '-') && !pair[1].is_empty()
+                !pair[0].is_empty()
+                    && pair[1].chars().all(|character| character == '-')
+                    && !pair[1].is_empty()
             })
             .map(|pair| pair[0])
             .collect()
@@ -562,6 +626,8 @@ mod tests {
             "  assistant lines without usage                       1",
             "  requests before dedup                              10",
             "  duplicates collapsed                                2",
+            "    with different input or cache                     1",
+            "  cache split mismatches                              3",
             "  filtered out                                        1",
             "  requests in range                                   7",
             "  priced                                      1,234,569",
@@ -588,13 +654,30 @@ mod tests {
         assert!(text.contains("  2026-09             2           $10.00            $0.00           $10.00          1\n"), "{text}");
         assert!(text.contains("  2026-10     1,234,567            $2.50            $1.25            $3.75          3\n"), "{text}");
         assert!(text.contains("  all         1,234,569           $12.50            $1.25           $13.75          4\n"), "{text}");
+        assert!(
+            !text.contains("fall in months without priced usage"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn text_report_counts_unpriced_requests_outside_the_month_table() {
+        let mut report = sample_report(Granularity::Message);
+        report.unpriced.synthetic += 2;
+        let text = rendered(&report);
+        assert!(
+            text.contains(
+                "  2 unpriced requests fall in months without priced usage and are not listed\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]
     fn text_report_plans_show_notes_and_sensitivity() {
         let text = rendered(&sample_report(Granularity::Message));
-        assert!(text.contains("  plan                                avg/month       peak month            total\n"), "{text}");
-        assert!(text.contains("  API pay-as-you-go                       $6.88           $10.00           $13.75\n"), "{text}");
+        assert!(text.contains("  plan                          seats        avg/month       peak month            total\n"), "{text}");
+        assert!(text.contains("  API pay-as-you-go                 1            $6.88           $10.00           $13.75\n"), "{text}");
         assert!(
             text.contains("    seats raised to the plan minimum of 1"),
             "{text}"
@@ -604,6 +687,34 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.matches("allowance anchor halved").count(), 1);
+    }
+
+    #[test]
+    fn text_report_plans_list_every_month_per_plan() {
+        let report = sample_report(Granularity::Message);
+        let text = rendered(&report);
+        let header = format!(
+            "  {:<7}{}\n",
+            "month",
+            report
+                .plans
+                .iter()
+                .map(|plan| format!(" {:>12}", plan.plan_id.chars().take(12).collect::<String>()))
+                .collect::<String>()
+        );
+        let matrix = text
+            .split_once(&header)
+            .map(|(_, after)| after)
+            .unwrap_or_else(|| panic!("no plan matrix header in {text}"));
+        for plan in &report.plans {
+            for month in &plan.months {
+                let row = matrix
+                    .lines()
+                    .find(|line| line.starts_with(&format!("  {}", month.month)))
+                    .unwrap_or_else(|| panic!("no row for {}", month.month));
+                assert!(row.contains(&month.total.to_string()), "{row}");
+            }
+        }
     }
 
     #[test]

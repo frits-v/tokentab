@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -25,6 +27,16 @@ impl Unpriced {
     }
 }
 
+/// The `--since` / `--until` bounds the scan applied. `until` is exclusive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RequestedRange {
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
+}
+
+/// One hundred years of months; a longer range is a typo in `--since` or `--until`.
+const MAX_MONTHS: i32 = 1_200;
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Report {
     pub source: String,
@@ -45,8 +57,21 @@ pub struct Report {
 pub enum ReportError {
     #[error("no transcript files were found")]
     NoFiles,
-    #[error("no priced requests in range ({unpriced} unpriced, {filtered_out} filtered out)")]
-    NothingPriced { unpriced: u64, filtered_out: u64 },
+    #[error(
+        "no priced requests in range ({unpriced} unpriced, {filtered_out} filtered out, \
+         {lines_unparseable} unparseable lines, \
+         {assistant_lines_without_usage} assistant lines without usage)"
+    )]
+    NothingPriced {
+        unpriced: u64,
+        filtered_out: u64,
+        lines_unparseable: u64,
+        assistant_lines_without_usage: u64,
+    },
+    #[error("the range spans {months} months; at most {MAX_MONTHS} are supported")]
+    RangeTooLong { months: i32 },
+    #[error("usage totals do not fit in u64 nanodollars")]
+    Overflow,
     #[error(transparent)]
     Plan(#[from] PlanError),
 }
@@ -55,12 +80,18 @@ pub enum ReportError {
 /// split on `entrypoint.credits_eligible()`, then runs the plan estimate and the
 /// pattern analysis. Fails rather than reporting a clean zero when nothing was scanned
 /// or nothing could be priced.
+///
+/// The report range runs from `range.since` (or the first priced request's UTC day)
+/// to the day before `range.until` (or the last priced request's UTC day). Every
+/// calendar month it touches gets a row, idle months included, except a month holding
+/// only unpriced requests.
 pub fn build(
     source: String,
     scan: Scan,
     prices: &PriceList,
     catalog: &PlanCatalog,
     options: EstimateOptions,
+    range: RequestedRange,
 ) -> Result<Report, ReportError> {
     if scan.stats.files_seen == 0 {
         return Err(ReportError::NoFiles);
@@ -88,8 +119,17 @@ pub fn build(
         return Err(ReportError::NothingPriced {
             unpriced: unpriced.total(),
             filtered_out: scan.stats.events_filtered_out,
+            lines_unparseable: scan.stats.lines_unparseable,
+            assistant_lines_without_usage: scan.stats.assistant_lines_without_usage,
         });
     }
+    // Every later sum (months, plans, patterns) is a partial sum of this one.
+    priced
+        .iter()
+        .try_fold(Cost::default(), |sum, priced_event| {
+            sum.checked_add(&priced_event.cost)
+        })
+        .ok_or(ReportError::Overflow)?;
 
     let first_event = priced
         .iter()
@@ -99,7 +139,11 @@ pub fn build(
         .iter()
         .map(|priced_event| priced_event.event.timestamp)
         .max();
-    let months = group_by_month(&priced, &unpriced_by_month);
+    let (first_day, last_day) = match (first_event, last_event) {
+        (Some(first), Some(last)) => report_days(first, last, range),
+        _ => unreachable!("priced is not empty"),
+    };
+    let months = group_by_month(&priced, &unpriced_by_month, first_day, last_day)?;
     let plans = plans::estimate(catalog, &options, &months)?;
     let patterns = patterns::analyse(&priced, scan.granularity);
 
@@ -119,22 +163,76 @@ pub fn build(
     })
 }
 
-/// Months come from priced events only: a month holding nothing but unpriced
-/// requests would otherwise charge a seat fee for usage nobody can price.
+/// First and last UTC day of the report range, both inclusive. The scan filter already
+/// keeps every event inside `[since, until)`, so the bounds only ever widen the range.
+fn report_days(
+    first_event: Timestamp,
+    last_event: Timestamp,
+    range: RequestedRange,
+) -> (Date, Date) {
+    let start = range
+        .since
+        .map_or(first_event, |since| since.min(first_event));
+    let end = range.until.map_or(last_event, |until| {
+        let last_included = until
+            .checked_sub(SignedDuration::from_nanos(1))
+            .unwrap_or(until);
+        last_included.max(last_event)
+    });
+    (utc_day(start), utc_day(end))
+}
+
+fn utc_day(timestamp: Timestamp) -> Date {
+    timestamp.to_zoned(TimeZone::UTC).date()
+}
+
+/// One row per calendar month from `first_day` to `last_day`, each with the days of it
+/// the range covers. A month holding nothing but unpriced requests gets no row: it would
+/// otherwise charge a seat fee for usage nobody can price. A month with no requests at
+/// all keeps its zero row, so seat plans pay for it and averages count it.
 fn group_by_month(
     priced: &[PricedEvent],
     unpriced_by_month: &BTreeMap<YearMonth, u64>,
-) -> Vec<MonthUsage> {
-    let mut by_month: BTreeMap<YearMonth, MonthUsage> = BTreeMap::new();
-    for priced_event in priced {
-        let month = YearMonth::of(priced_event.event.timestamp);
-        let usage = by_month.entry(month).or_insert_with(|| MonthUsage {
-            month,
-            interactive: Cost::default(),
-            headless: Cost::default(),
-            requests: 0,
-            unpriced_requests: unpriced_by_month.get(&month).copied().unwrap_or(0),
+    first_day: Date,
+    last_day: Date,
+) -> Result<Vec<MonthUsage>, ReportError> {
+    let month_count = (i32::from(last_day.year()) - i32::from(first_day.year())) * 12
+        + i32::from(last_day.month())
+        - i32::from(first_day.month())
+        + 1;
+    if month_count > MAX_MONTHS {
+        return Err(ReportError::RangeTooLong {
+            months: month_count,
         });
+    }
+
+    let mut by_month: BTreeMap<YearMonth, MonthUsage> = BTreeMap::new();
+    let mut month_start = first_day.first_of_month();
+    for _ in 0..month_count {
+        let month = YearMonth::of_date(month_start);
+        let month_end = month_start.last_of_month();
+        by_month.insert(
+            month,
+            MonthUsage {
+                month,
+                covered_from: month_start.max(first_day),
+                covered_through: month_end.min(last_day),
+                interactive: Cost::default(),
+                headless: Cost::default(),
+                requests: 0,
+                unpriced_requests: unpriced_by_month.get(&month).copied().unwrap_or(0),
+            },
+        );
+        match month_end.tomorrow() {
+            Ok(next) => month_start = next,
+            Err(_) => break,
+        }
+    }
+
+    for priced_event in priced {
+        let usage = by_month
+            .get_mut(&YearMonth::of(priced_event.event.timestamp))
+            .expect("every priced request falls inside the report range");
         if priced_event.event.entrypoint.credits_eligible() {
             usage.headless = usage.headless.add(&priced_event.cost);
         } else {
@@ -142,11 +240,13 @@ fn group_by_month(
         }
         usage.requests += 1;
     }
-    by_month.into_values().collect()
+    Ok(by_month
+        .into_values()
+        .filter(|usage| usage.requests > 0 || usage.unpriced_requests == 0)
+        .collect())
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::domain::money::{Money, PerToken};
@@ -192,6 +292,44 @@ mod tests {
         }
     }
 
+    fn catalog_with_pro() -> PlanCatalog {
+        let mut with_pro = catalog();
+        with_pro.plans.push(Plan {
+            id: "pro".into(),
+            name: "Pro".into(),
+            kind: PlanKind::Subscription,
+            seat_monthly: Some(Money::from_usd(20.0)),
+            seat_annual: None,
+            min_seats: 1,
+            max_seats: Some(1),
+            allowance_multiple: 1.0,
+            api_credits_per_seat: Money::ZERO,
+            api_credits_pool_cap: None,
+            extra_usage_at_api_rates: true,
+        });
+        with_pro
+    }
+
+    fn at(text: &str) -> Timestamp {
+        text.parse().expect("test timestamps are valid RFC 3339")
+    }
+
+    fn months_of(report: &Report) -> Vec<String> {
+        report
+            .months
+            .iter()
+            .map(|usage| usage.month.to_string())
+            .collect()
+    }
+
+    fn pro(report: &Report) -> &PlanEstimate {
+        report
+            .plans
+            .iter()
+            .find(|plan| plan.plan_id == "pro")
+            .expect("pro is in the catalog")
+    }
+
     fn options() -> EstimateOptions {
         EstimateOptions {
             seats: 1,
@@ -229,6 +367,8 @@ mod tests {
             files_seen,
             events: events.len() as u64,
             events_filtered_out: 4,
+            lines_unparseable: 5,
+            assistant_lines_without_usage: 6,
             ..ScanStats::default()
         };
         Scan {
@@ -246,6 +386,7 @@ mod tests {
             &price_list(),
             &catalog(),
             options(),
+            RequestedRange::default(),
         );
         assert_eq!(result, Err(ReportError::NoFiles));
     }
@@ -275,12 +416,15 @@ mod tests {
             &price_list(),
             &catalog(),
             options(),
+            RequestedRange::default(),
         );
         assert_eq!(
             result,
             Err(ReportError::NothingPriced {
                 unpriced: 3,
-                filtered_out: 4
+                filtered_out: 4,
+                lines_unparseable: 5,
+                assistant_lines_without_usage: 6,
             })
         );
     }
@@ -322,6 +466,7 @@ mod tests {
             &price_list(),
             &catalog(),
             options(),
+            RequestedRange::default(),
         )
         .expect("two months are priceable");
 
@@ -374,6 +519,174 @@ mod tests {
     }
 
     #[test]
+    fn gap_month_gets_a_zero_row_and_a_seat_fee() {
+        let events = vec![
+            event("2026-09-10T10:00:00Z", opus(), Entrypoint::Interactive),
+            event("2026-11-10T10:00:00Z", opus(), Entrypoint::Interactive),
+        ];
+        let report = build(
+            "test".into(),
+            scan(1, events),
+            &price_list(),
+            &catalog_with_pro(),
+            options(),
+            RequestedRange::default(),
+        )
+        .expect("two priced events");
+        assert_eq!(months_of(&report), ["2026-09", "2026-10", "2026-11"]);
+        let october = &report.months[1];
+        assert_eq!(october.requests, 0);
+        assert_eq!(october.unpriced_requests, 0);
+        assert_eq!(october.interactive.total(), Money::ZERO);
+        assert_eq!(october.headless.total(), Money::ZERO);
+        assert!(october.is_complete());
+        let pro = pro(&report);
+        assert_eq!(pro.months.len(), 3);
+        assert_eq!(pro.months[1].seat_fee, Money::from_usd(20.0));
+        assert_eq!(pro.total, Money::from_usd(60.0));
+        assert_eq!(pro.average_month, Money::from_usd(20.0));
+    }
+
+    #[test]
+    fn requested_range_bills_every_month_it_covers() {
+        let events = vec![
+            event("2026-08-10T10:00:00Z", opus(), Entrypoint::Interactive),
+            event("2026-10-31T23:00:00Z", opus(), Entrypoint::Interactive),
+        ];
+        let range = RequestedRange {
+            since: Some(at("2026-08-01T00:00:00Z")),
+            until: Some(at("2026-11-01T00:00:00Z")),
+        };
+        let report = build(
+            "test".into(),
+            scan(1, events),
+            &price_list(),
+            &catalog_with_pro(),
+            options(),
+            range,
+        )
+        .expect("two priced events");
+        assert_eq!(months_of(&report), ["2026-08", "2026-09", "2026-10"]);
+        assert!(report.months.iter().all(MonthUsage::is_complete));
+        let pro = pro(&report);
+        assert_eq!(pro.total, Money::from_usd(20.0).times(3));
+        assert!(pro.notes.is_empty(), "{:?}", pro.notes);
+    }
+
+    #[test]
+    fn range_ends_are_partial_without_bounds() {
+        let events = vec![
+            event("2026-08-10T10:00:00Z", opus(), Entrypoint::Interactive),
+            event("2026-09-15T10:00:00Z", opus(), Entrypoint::Interactive),
+            event("2026-10-20T23:59:59Z", opus(), Entrypoint::Interactive),
+        ];
+        let report = build(
+            "test".into(),
+            scan(1, events),
+            &price_list(),
+            &catalog_with_pro(),
+            options(),
+            RequestedRange::default(),
+        )
+        .expect("three priced events");
+        let spans: Vec<(String, i8, bool)> = report
+            .months
+            .iter()
+            .map(|usage| {
+                (
+                    usage.month.to_string(),
+                    usage.days_covered(),
+                    usage.is_complete(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                ("2026-08".to_string(), 22, false),
+                ("2026-09".to_string(), 30, true),
+                ("2026-10".to_string(), 20, false),
+            ]
+        );
+        assert_eq!(
+            pro(&report).notes,
+            vec![
+                "partial months excluded from avg/peak: 2026-08 (22 days), 2026-10 (20 days)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn unpriced_only_month_between_priced_months_adds_no_seat_fee() {
+        let events = vec![
+            event("2026-08-10T10:00:00Z", opus(), Entrypoint::Interactive),
+            event(
+                "2026-09-10T10:00:00Z",
+                ModelName::Synthetic,
+                Entrypoint::Interactive,
+            ),
+            event("2026-10-10T10:00:00Z", opus(), Entrypoint::Interactive),
+        ];
+        let report = build(
+            "test".into(),
+            scan(1, events),
+            &price_list(),
+            &catalog_with_pro(),
+            options(),
+            RequestedRange::default(),
+        )
+        .expect("two priced events");
+        assert_eq!(months_of(&report), ["2026-08", "2026-10"]);
+        assert_eq!(report.unpriced.synthetic, 1);
+        assert_eq!(pro(&report).total, Money::from_usd(40.0));
+    }
+
+    #[test]
+    fn range_longer_than_the_month_cap_is_rejected() {
+        let events = vec![event(
+            "2026-08-10T10:00:00Z",
+            opus(),
+            Entrypoint::Interactive,
+        )];
+        let range = RequestedRange {
+            since: Some(at("1900-01-01T00:00:00Z")),
+            until: None,
+        };
+        let result = build(
+            "test".into(),
+            scan(1, events),
+            &price_list(),
+            &catalog(),
+            options(),
+            range,
+        );
+        assert_eq!(result, Err(ReportError::RangeTooLong { months: 1520 }));
+    }
+
+    #[test]
+    fn usage_totals_beyond_u64_nanodollars_are_an_error() {
+        let mut prices = price_list();
+        prices.models[0].tiers[0].input = PerToken::from_usd_per_mtok(1_000_000.0);
+        let mut events = vec![
+            event("2026-08-10T10:00:00Z", opus(), Entrypoint::Interactive),
+            event("2026-08-11T10:00:00Z", opus(), Entrypoint::Interactive),
+        ];
+        for heavy in &mut events {
+            heavy.tokens.input = 10_000_000_000;
+        }
+        let result = build(
+            "test".into(),
+            scan(1, events),
+            &prices,
+            &catalog(),
+            options(),
+            RequestedRange::default(),
+        );
+        assert_eq!(result, Err(ReportError::Overflow));
+    }
+
+    #[test]
     fn report_anchor_override_wins_over_catalog() {
         let events = vec![event(
             "2026-09-30T04:12:00Z",
@@ -390,6 +703,7 @@ mod tests {
             &price_list(),
             &catalog(),
             overridden,
+            RequestedRange::default(),
         )
         .expect("one priced event");
         assert_eq!(report.allowance_anchor, Money::from_usd(90.0));
@@ -398,7 +712,6 @@ mod tests {
 
 /// Hand-built reports for the renderer tests, independent of the pricing, plan and pattern arithmetic.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub(crate) mod fixtures {
     use super::*;
     use crate::domain::money::Money;
@@ -407,6 +720,7 @@ pub(crate) mod fixtures {
     };
     use crate::domain::plans::{Billing, CreditsMode, PlanKind, PlanMonth, Sensitivity};
     use crate::domain::usage::TokenUsage;
+    use jiff::civil::date;
 
     fn timestamp(text: &str) -> Timestamp {
         text.parse().expect("fixture timestamps are valid RFC 3339")
@@ -491,6 +805,8 @@ pub(crate) mod fixtures {
                 assistant_lines_without_usage: 1,
                 events_before_dedup: 10,
                 duplicates_collapsed: 2,
+                conflicting_duplicates: 1,
+                cache_split_mismatches: 3,
                 events_filtered_out: 1,
                 events: 7,
                 other_line_types,
@@ -499,14 +815,15 @@ pub(crate) mod fixtures {
             options: EstimateOptions { seats: 1, billing: Billing::Monthly, credits: CreditsMode::Apply, allowance_anchor: None },
             allowance_anchor: Money::from_usd(60.0),
             months: vec![
-                MonthUsage { month: september, interactive: cost(10.0), headless: Cost::default(), requests: 2, unpriced_requests: 1 },
-                MonthUsage { month: october, interactive: cost(2.5), headless: cost(1.25), requests: 1_234_567, unpriced_requests: 3 },
+                MonthUsage { month: september, covered_from: date(2026, 9, 30), covered_through: date(2026, 9, 30), interactive: cost(10.0), headless: Cost::default(), requests: 2, unpriced_requests: 1 },
+                MonthUsage { month: october, covered_from: date(2026, 10, 1), covered_through: date(2026, 10, 2), interactive: cost(2.5), headless: cost(1.25), requests: 1_234_567, unpriced_requests: 3 },
             ],
             plans: vec![
                 PlanEstimate {
                     plan_id: "api".into(),
                     plan_name: "API pay-as-you-go".into(),
                     kind: PlanKind::PayAsYouGo,
+                    seats_billed: 1,
                     months: vec![plan_month(september, 10.0), plan_month(october, 3.75)],
                     average_month: Money::from_usd(6.875),
                     peak_month: Money::from_usd(10.0),
@@ -518,6 +835,7 @@ pub(crate) mod fixtures {
                     plan_id: "pro".into(),
                     plan_name: "Pro".into(),
                     kind: PlanKind::Subscription,
+                    seats_billed: 1,
                     months: vec![plan_month(september, 20.0), plan_month(october, 20.0)],
                     average_month: Money::from_usd(20.0),
                     peak_month: Money::from_usd(20.0),

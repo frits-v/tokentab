@@ -14,7 +14,7 @@ use crate::domain::pricing::{ModelPrice, PriceList, PriceListError, PriceTier};
 pub const DEFAULT_PRICING: &str = include_str!("../../pricing/anthropic.toml");
 
 /// Bounds that keep every converted amount far inside u64 nanodollars, even times `MAX_SEATS`.
-const MAX_USD_PER_MTOK: f64 = 1_000_000.0;
+const MAX_USD_PER_MTOK: f64 = 10_000.0;
 pub const MAX_USD_AMOUNT: f64 = 100_000.0;
 pub const MAX_SEATS: u32 = 10_000;
 
@@ -101,9 +101,9 @@ impl PlanKindEntry {
     }
 }
 
-/// Parses the TOML text. Validates at this boundary: every price finite and
-/// non-negative, every plan with at least one billing option, `min_seats >= 1`,
-/// `allowance_multiple >= 0`, and plan ids unique.
+/// Parses the TOML text. Validates at this boundary: `as_of` a YYYY-MM-DD date, every
+/// price finite and non-negative, every plan with at least one billing option,
+/// `1 <= min_seats <= max_seats <= MAX_SEATS`, `allowance_multiple >= 0`, and plan ids unique.
 pub fn load(text: &str) -> Result<Loaded, PricingFileError> {
     // Parsed as a plain table first so a syntax error and a schema error are reported as different kinds.
     text.parse::<toml::Table>()
@@ -111,6 +111,12 @@ pub fn load(text: &str) -> Result<Loaded, PricingFileError> {
     let file: PricingFile =
         toml::from_str(text).map_err(|error| PricingFileError::Invalid(error.to_string()))?;
 
+    if file.as_of.parse::<jiff::civil::Date>().is_err() {
+        return Err(PricingFileError::Invalid(format!(
+            "as_of: expected YYYY-MM-DD, got {:?}",
+            file.as_of
+        )));
+    }
     let mut models = Vec::with_capacity(file.models.len());
     for entry in &file.models {
         models.push(convert_model(entry)?);
@@ -180,8 +186,21 @@ fn convert_plan(entry: &PlanEntry) -> Result<Plan, PricingFileError> {
             "needs seat_monthly_usd or seat_annual_usd unless kind is pay_as_you_go",
         ));
     }
-    if entry.min_seats < 1 {
-        return Err(invalid(&place, "min_seats", "must be at least 1"));
+    if !(1..=MAX_SEATS).contains(&entry.min_seats) {
+        return Err(invalid(
+            &place,
+            "min_seats",
+            &format!("must be between 1 and {MAX_SEATS}, got {}", entry.min_seats),
+        ));
+    }
+    if let Some(max_seats) = entry.max_seats
+        && max_seats > MAX_SEATS
+    {
+        return Err(invalid(
+            &place,
+            "max_seats",
+            &format!("must be at most {MAX_SEATS}, got {max_seats}"),
+        ));
     }
     if let Some(max_seats) = entry.max_seats
         && max_seats < entry.min_seats
@@ -270,7 +289,6 @@ fn invalid(place: &str, field: &str, reason: &str) -> PricingFileError {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::domain::pricing::Priced;
@@ -336,6 +354,38 @@ extra_usage_at_api_rates = true
         assert_eq!(haiku.tiers[0].prompt_tokens_over, 0);
         assert_eq!(haiku.tiers[1].prompt_tokens_over, 100_000);
         assert_eq!(haiku.tiers[1].input, PerToken::from_usd_per_mtok(0.50));
+    }
+
+    #[test]
+    fn default_cache_reads_follow_the_published_multipliers() {
+        let loaded = default_loaded();
+        let cache_read = |id: &str| {
+            loaded
+                .prices
+                .find(id)
+                .map(|model| model.tiers[0].cache_read)
+                .expect("model is listed")
+        };
+        assert_eq!(
+            cache_read("claude-mythos-5-1"),
+            PerToken::from_usd_per_mtok(0.25)
+        );
+        assert_eq!(
+            cache_read("claude-mythos-5"),
+            PerToken::from_usd_per_mtok(1.0)
+        );
+        assert_eq!(
+            cache_read("claude-fable-5-1"),
+            PerToken::from_usd_per_mtok(0.25)
+        );
+        assert_eq!(
+            cache_read("claude-opus-5-5"),
+            PerToken::from_usd_per_mtok(0.20)
+        );
+        assert_eq!(
+            cache_read("claude-sonnet-5-5"),
+            PerToken::from_usd_per_mtok(0.10)
+        );
     }
 
     #[test]
@@ -545,6 +595,48 @@ extra_usage_at_api_rates = true
         assert!(zero.contains("min_seats"), "{zero}");
         let inverted = invalid_message(&MINIMAL.replace("min_seats = 1", "min_seats = 3"));
         assert!(inverted.contains("max_seats"), "{inverted}");
+    }
+
+    #[test]
+    fn seat_counts_above_the_seat_cap_are_rejected() {
+        let min = invalid_message(
+            &MINIMAL
+                .replace("min_seats = 1", "min_seats = 4000000000")
+                .replace("max_seats = 1\n", ""),
+        );
+        assert!(min.contains("min_seats") && min.contains("10000"), "{min}");
+        let max = invalid_message(&MINIMAL.replace("max_seats = 1", "max_seats = 10001"));
+        assert!(max.contains("max_seats") && max.contains("10000"), "{max}");
+        let loaded = load(
+            &MINIMAL
+                .replace("min_seats = 1", "min_seats = 10000")
+                .replace("max_seats = 1", "max_seats = 10000"),
+        )
+        .expect("the cap itself is allowed");
+        assert_eq!(loaded.plans.plans[0].min_seats, 10_000);
+    }
+
+    #[test]
+    fn price_above_the_per_token_cap_is_rejected() {
+        let message = invalid_message(&MINIMAL.replace("output = 20.0", "output = 10000.001"));
+        assert!(message.contains("output"), "{message}");
+        let loaded = load(&MINIMAL.replace("output = 20.0", "output = 10000.0"))
+            .expect("the cap itself is allowed");
+        assert_eq!(
+            loaded.prices.models[0].tiers[0].output,
+            PerToken::from_usd_per_mtok(10_000.0)
+        );
+    }
+
+    #[test]
+    fn as_of_must_be_a_date() {
+        let message =
+            invalid_message(&MINIMAL.replace("as_of = \"2026-10-28\"", "as_of = \"last week\""));
+        assert!(
+            message.contains("as_of") && message.contains("last week"),
+            "{message}"
+        );
+        invalid_message(&MINIMAL.replace("as_of = \"2026-10-28\"", "as_of = \"2026-02-30\""));
     }
 
     #[test]

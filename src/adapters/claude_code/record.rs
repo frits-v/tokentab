@@ -78,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_with_usage_is_priced() -> Result<(), serde_json::Error> {
+    fn assistant_with_usage_is_classified_as_billable() -> Result<(), serde_json::Error> {
         let line =
             parse(r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":2}}}"#)?;
         assert!(matches!(line.classify(), LineKind::AssistantWithUsage(_)));

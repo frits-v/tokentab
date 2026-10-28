@@ -1,8 +1,8 @@
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use tokentab::adapters::claude_code::ClaudeCodeTranscripts;
@@ -11,7 +11,7 @@ use tokentab::adapters::render_json::JsonRenderer;
 use tokentab::adapters::render_text::TextRenderer;
 use tokentab::domain::money::Money;
 use tokentab::domain::plans::{Billing, CreditsMode, EstimateOptions};
-use tokentab::domain::report;
+use tokentab::domain::report::{self, RequestedRange};
 use tokentab::domain::usage::ScanFilter;
 use tokentab::ports::renderer::Renderer;
 use tokentab::ports::usage_source::UsageSource;
@@ -52,23 +52,31 @@ struct EstimateArgs {
     /// Price list TOML (default: the list compiled into the binary).
     #[arg(long)]
     pricing: Option<PathBuf>,
-    /// Seats to bill for Team and Enterprise; plan minimums are applied and noted.
-    #[arg(long, default_value_t = 1)]
+    /// Seats to bill for Team and Enterprise (1 to 10000); plan minimums are applied and noted.
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(pricing_toml::MAX_SEATS)),
+        allow_negative_numbers = true
+    )]
     seats: u32,
+    /// Seat price to use: monthly or annual billing.
     #[arg(long, value_enum, default_value_t = BillingArg::Monthly)]
     billing: BillingArg,
     /// Whether bundled Max/Team API credits offset SDK and headless usage.
     #[arg(long, value_enum, default_value_t = CreditsArg::Apply)]
     credits: CreditsArg,
     /// API-equivalent dollars one Pro seat gets per month; every allowance is a multiple of it.
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     allowance_anchor: Option<f64>,
+    /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
 }
 
 #[derive(clap::Args)]
 struct PricesArgs {
+    /// Price list TOML (default: the list compiled into the binary).
     #[arg(long)]
     pricing: Option<PathBuf>,
 }
@@ -91,14 +99,27 @@ enum Format {
     Json,
 }
 
+/// Exit status a shell reports for a process killed by SIGPIPE (128 + 13).
+const EXIT_BROKEN_PIPE: u8 = 141;
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) if is_broken_pipe(&error) => ExitCode::from(EXIT_BROKEN_PIPE),
         Err(error) => {
             eprintln!("tokentab: {error:#}");
             ExitCode::from(2)
         }
     }
+}
+
+/// The reader of stdout went away (`tokentab prices | head`): stop quietly.
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_error| io_error.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 fn run() -> Result<()> {
@@ -125,9 +146,16 @@ fn estimate(args: EstimateArgs) -> Result<()> {
         None => ClaudeCodeTranscripts::default_dir()
             .context("cannot find the home directory; pass --projects-dir")?,
     };
+    let since = args.since.as_deref().map(parse_utc_date).transpose()?;
+    let until = args.until.as_deref().map(parse_utc_date).transpose()?;
+    if let (Some(since), Some(until)) = (since, until)
+        && since >= until
+    {
+        bail!("--since must be before --until");
+    }
     let filter = ScanFilter {
-        since: args.since.as_deref().map(parse_utc_date).transpose()?,
-        until: args.until.as_deref().map(parse_utc_date).transpose()?,
+        since,
+        until,
         project_substring: args.project,
     };
     let options = EstimateOptions {
@@ -142,13 +170,17 @@ fn estimate(args: EstimateArgs) -> Result<()> {
         },
         allowance_anchor: args.allowance_anchor.map(anchor_from_arg).transpose()?,
     };
-    if args.seats == 0 || args.seats > pricing_toml::MAX_SEATS {
-        bail!("--seats must be between 1 and {}", pricing_toml::MAX_SEATS);
-    }
 
     let source = ClaudeCodeTranscripts::new(projects_dir);
     let scan = source.scan(&filter)?;
-    let report = report::build(source.name(), scan, &loaded.prices, &loaded.plans, options)?;
+    let report = report::build(
+        source.name(),
+        scan,
+        &loaded.prices,
+        &loaded.plans,
+        options,
+        RequestedRange { since, until },
+    )?;
 
     let renderer: Box<dyn Renderer> = match args.format {
         Format::Text => Box::new(TextRenderer),
@@ -162,15 +194,19 @@ fn estimate(args: EstimateArgs) -> Result<()> {
 
 fn prices(args: PricesArgs) -> Result<()> {
     let loaded = load_pricing(args.pricing.as_ref())?;
-    println!("price list as of {}", loaded.prices.as_of);
-    println!(
-        "{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}  prompt tokens over",
-        "model", "input", "output", "cache rd", "write 5m", "write 1h"
-    );
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "price list as of {}", loaded.prices.as_of)?;
+    writeln!(
+        out,
+        "{:<20} {:>10} {:>10} {:>10} {:>10} {:>10}  prompt tokens over",
+        "model", "input", "output", "cache read", "write 5m", "write 1h"
+    )?;
     for model in &loaded.prices.models {
         for tier in &model.tiers {
-            println!(
-                "{:<28} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3}  {}",
+            writeln!(
+                out,
+                "{:<20} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3}  {}",
                 model.id,
                 tier.input.usd_per_mtok(),
                 tier.output.usd_per_mtok(),
@@ -178,36 +214,35 @@ fn prices(args: PricesArgs) -> Result<()> {
                 tier.cache_write_5m.usd_per_mtok(),
                 tier.cache_write_1h.usd_per_mtok(),
                 tier.prompt_tokens_over
-            );
+            )?;
         }
     }
-    println!();
-    println!(
+    writeln!(out)?;
+    writeln!(
+        out,
         "allowance anchor {} per Pro seat per month",
         loaded.plans.allowance_anchor
-    );
-    println!(
-        "{:<16} {:<18} {:>10} {:>10} {:>5} {:>9} {:>10} {:>9}",
-        "plan", "kind", "monthly", "annual", "min", "allow x", "credits", "pool cap"
-    );
+    )?;
+    writeln!(
+        out,
+        "{:<16} {:<15} {:>10} {:>10} {:>5} {:>5} {:>11} {:>10} {:>9}",
+        "plan", "kind", "monthly", "annual", "min", "max", "allowance x", "credits", "pool cap"
+    )?;
+    let or_dash = |value: Option<String>| value.unwrap_or_else(|| "-".to_string());
     for plan in &loaded.plans.plans {
-        println!(
-            "{:<16} {:<18} {:>10} {:>10} {:>5} {:>9.1} {:>10} {:>9}",
+        writeln!(
+            out,
+            "{:<16} {:<15} {:>10} {:>10} {:>5} {:>5} {:>11.1} {:>10} {:>9}",
             plan.id,
-            format!("{:?}", plan.kind),
-            plan.seat_monthly
-                .map(|money| money.to_string())
-                .unwrap_or_else(|| "-".into()),
-            plan.seat_annual
-                .map(|money| money.to_string())
-                .unwrap_or_else(|| "-".into()),
+            plan.kind.label(),
+            or_dash(plan.seat_monthly.map(|money| money.to_string())),
+            or_dash(plan.seat_annual.map(|money| money.to_string())),
             plan.min_seats,
+            or_dash(plan.max_seats.map(|seats| seats.to_string())),
             plan.allowance_multiple,
             plan.api_credits_per_seat,
-            plan.api_credits_pool_cap
-                .map(|money| money.to_string())
-                .unwrap_or_else(|| "-".into()),
-        );
+            or_dash(plan.api_credits_pool_cap.map(|money| money.to_string())),
+        )?;
     }
     Ok(())
 }
@@ -215,11 +250,11 @@ fn prices(args: PricesArgs) -> Result<()> {
 fn parse_utc_date(text: &str) -> Result<jiff::Timestamp> {
     let date: jiff::civil::Date = text
         .parse()
-        .with_context(|| format!("{text}: expected YYYY-MM-DD"))?;
-    Ok(date
+        .map_err(|_| anyhow!("expected YYYY-MM-DD, got {text}"))?;
+    let zoned = date
         .to_zoned(jiff::tz::TimeZone::UTC)
-        .with_context(|| format!("{text}: not a valid UTC date"))?
-        .timestamp())
+        .map_err(|_| anyhow!("{text} is outside the supported date range"))?;
+    Ok(zoned.timestamp())
 }
 
 fn anchor_from_arg(usd: f64) -> Result<Money> {

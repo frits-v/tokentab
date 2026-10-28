@@ -62,6 +62,22 @@ impl Cost {
         self.input + self.output + self.cache_read + self.cache_write
     }
 
+    /// `None` when any component or the total would not fit in u64 nanodollars.
+    pub fn checked_add(&self, other: &Cost) -> Option<Cost> {
+        let sum = Cost {
+            input: self.input.checked_add(other.input)?,
+            output: self.output.checked_add(other.output)?,
+            cache_read: self.cache_read.checked_add(other.cache_read)?,
+            cache_write: self.cache_write.checked_add(other.cache_write)?,
+            without_cache: self.without_cache.checked_add(other.without_cache)?,
+        };
+        sum.input
+            .checked_add(sum.output)?
+            .checked_add(sum.cache_read)?
+            .checked_add(sum.cache_write)?;
+        Some(sum)
+    }
+
     pub fn add(&self, other: &Cost) -> Cost {
         Cost {
             input: self.input + other.input,
@@ -153,7 +169,6 @@ impl ModelPrice {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -374,12 +389,17 @@ mod tests {
             ..TokenUsage::default()
         };
         let named = list.price(&ModelName::Named("claude-haiku-5-5".into()), &tokens);
-        let expected_cost = haiku_5_5().cost(&tokens);
         assert_eq!(
             named,
             Priced::Priced {
                 model: "claude-haiku-5-5".into(),
-                cost: expected_cost
+                cost: Cost {
+                    input: Money::from_usd(0.0001),
+                    output: Money::from_usd(0.0005),
+                    cache_read: Money::ZERO,
+                    cache_write: Money::ZERO,
+                    without_cache: Money::from_usd(0.0006),
+                }
             }
         );
         assert_eq!(

@@ -1,5 +1,3 @@
-#![allow(clippy::expect_used)]
-
 use tokentab::adapters::render_json::JsonRenderer;
 use tokentab::adapters::render_text::TextRenderer;
 use tokentab::domain::money::{Money, PerToken};
@@ -7,7 +5,7 @@ use tokentab::domain::plans::{
     Billing, CreditsMode, EstimateOptions, Plan, PlanCatalog, PlanKind, YearMonth,
 };
 use tokentab::domain::pricing::{ModelPrice, PriceList, PriceTier};
-use tokentab::domain::report::{self, Report, ReportError};
+use tokentab::domain::report::{self, Report, ReportError, RequestedRange};
 use tokentab::domain::usage::{
     Entrypoint, Granularity, ModelName, Scan, ScanStats, TokenUsage, UsageEvent,
 };
@@ -153,6 +151,7 @@ fn built() -> Report {
         &price_list(),
         &catalog(),
         options(),
+        RequestedRange::default(),
     )
     .expect("three events are priceable")
 }
@@ -208,7 +207,11 @@ fn months_split_interactive_from_headless() {
     assert_eq!(october.unpriced_requests, 1);
     assert_eq!(october.interactive.total(), Money::ZERO);
     assert_eq!(october.headless.total(), Money::from_nanos(6_000_000));
+}
 
+#[test]
+fn built_report_estimates_every_catalog_plan() {
+    let report = built();
     let plan_ids: Vec<&str> = report
         .plans
         .iter()
@@ -227,6 +230,7 @@ fn no_files_is_an_error() {
         &price_list(),
         &catalog(),
         options(),
+        RequestedRange::default(),
     );
     assert_eq!(result.err(), Some(ReportError::NoFiles));
 }
@@ -243,12 +247,15 @@ fn nothing_priced_is_an_error() {
         &price_list(),
         &catalog(),
         options(),
+        RequestedRange::default(),
     );
     assert_eq!(
         result.err(),
         Some(ReportError::NothingPriced {
             unpriced: 2,
-            filtered_out: 7
+            filtered_out: 7,
+            lines_unparseable: 0,
+            assistant_lines_without_usage: 0,
         })
     );
 }
@@ -265,6 +272,10 @@ fn json_output_has_the_top_level_sections() {
     assert_eq!(value["scan"]["files_seen"], 2);
     assert_eq!(value["unpriced"]["unknown_models"]["claude-unreleased"], 1);
     assert_eq!(value["months"].as_array().map(Vec::len), Some(2));
+    assert_eq!(value["months"][0]["month"], "2026-09");
+    assert_eq!(value["months"][1]["month"], "2026-10");
+    assert_eq!(value["months"][0]["covered_from"], "2026-09-30");
+    assert_eq!(value["plans"][1]["months"][0]["month"], "2026-09");
     assert_eq!(value["plans"].as_array().map(Vec::len), Some(2));
 }
 

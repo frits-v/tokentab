@@ -44,6 +44,8 @@ fn fixture_stats_count_everything_examined() -> TestResult {
     assert_eq!(stats.assistant_lines_without_usage, 1);
     assert_eq!(stats.events_before_dedup, 11);
     assert_eq!(stats.duplicates_collapsed, 1);
+    assert_eq!(stats.conflicting_duplicates, 0);
+    assert_eq!(stats.cache_split_mismatches, 0);
     assert_eq!(stats.events_filtered_out, 0);
     assert_eq!(stats.events, 10);
     assert_eq!(scan.events.len(), 10);
@@ -69,9 +71,9 @@ fn events_are_sorted_by_timestamp() -> TestResult {
 #[test]
 fn streamed_message_keeps_the_final_block() -> TestResult {
     let scan = scan_fixtures(&ScanFilter::default())?;
-    let msg_1 = event(&scan, "msg_1")?;
+    let streamed = event(&scan, "msg_1")?;
     assert_eq!(
-        msg_1.tokens,
+        streamed.tokens,
         TokenUsage {
             input: 2,
             output: 246,
@@ -80,25 +82,28 @@ fn streamed_message_keeps_the_final_block() -> TestResult {
             cache_write_1h: 36476
         }
     );
-    assert_eq!(msg_1.model, ModelName::Named("claude-opus-5-5".into()));
-    assert_eq!(msg_1.entrypoint, Entrypoint::Interactive);
-    assert!(!msg_1.sidechain);
-    assert_eq!(msg_1.project, "/Users/example/src/demo");
-    assert_eq!(msg_1.session_id, "sess-a");
+    assert_eq!(streamed.model, ModelName::Named("claude-opus-5-5".into()));
+    assert_eq!(streamed.entrypoint, Entrypoint::Interactive);
+    assert!(!streamed.sidechain);
+    assert_eq!(streamed.project, "/Users/example/src/demo");
+    assert_eq!(streamed.session_id, "sess-a");
     assert_eq!(
-        msg_1.timestamp,
+        streamed.timestamp,
         "2026-09-30T04:12:38.100Z".parse::<Timestamp>()?
     );
     Ok(())
 }
 
 #[test]
-fn decoded_fields_on_fixture_events() -> TestResult {
+fn fixture_events_decode_snapshot_ids_synthetic_sidechain_and_entrypoints() -> TestResult {
     let scan = scan_fixtures(&ScanFilter::default())?;
-    let msg_6 = event(&scan, "msg_6")?;
-    assert_eq!(msg_6.model, ModelName::Named("claude-haiku-4-5".into()));
+    let dated_haiku = event(&scan, "msg_6")?;
     assert_eq!(
-        msg_6.tokens,
+        dated_haiku.model,
+        ModelName::Named("claude-haiku-4-5".into())
+    );
+    assert_eq!(
+        dated_haiku.tokens,
         TokenUsage {
             input: 1000,
             output: 100,
@@ -110,9 +115,9 @@ fn decoded_fields_on_fixture_events() -> TestResult {
     assert_eq!(event(&scan, "msg_3")?.model, ModelName::Synthetic);
     assert!(event(&scan, "msg_2")?.sidechain);
     assert_eq!(event(&scan, "msg_b1")?.entrypoint, Entrypoint::Sdk);
-    let msg_c1 = event(&scan, "msg_c1")?;
-    assert_eq!(msg_c1.entrypoint, Entrypoint::Desktop);
-    assert_eq!(msg_c1.project, "/Users/example/src/other");
+    let desktop_event = event(&scan, "msg_c1")?;
+    assert_eq!(desktop_event.entrypoint, Entrypoint::Desktop);
+    assert_eq!(desktop_event.project, "/Users/example/src/other");
     Ok(())
 }
 
