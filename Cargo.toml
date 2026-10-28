@@ -6,6 +6,9 @@ rust-version = "1.88"
 description = "Replays local AI coding transcripts through a price list and compares what they would have cost on each plan"
 license = "MIT"
 repository = "https://github.com/frits-v/tokentab"
+keywords = ["claude", "cli", "cost", "pricing", "transcripts"]
+categories = ["command-line-utilities"]
+exclude = [".github/", "lefthook.json", "mise.toml"]
 
 [[bin]]
 name = "tokentab"
