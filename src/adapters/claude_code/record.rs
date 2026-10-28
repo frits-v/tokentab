@@ -16,8 +16,6 @@ pub struct TranscriptLine {
     pub entrypoint: Option<String>,
     #[serde(rename = "isSidechain")]
     pub is_sidechain: Option<bool>,
-    #[serde(rename = "requestId")]
-    pub request_id: Option<String>,
     pub message: Option<Message>,
 }
 
@@ -56,6 +54,71 @@ pub enum LineKind<'a> {
 
 impl TranscriptLine {
     pub fn classify(&self) -> LineKind<'_> {
-        todo!("assistant + message.usage -> AssistantWithUsage; assistant without -> AssistantWithoutUsage; other known type string -> OtherType; missing type -> Unrecognised")
+        match self.kind.as_deref() {
+            Some("assistant") if self.usage().is_some() => LineKind::AssistantWithUsage(self),
+            Some("assistant") => LineKind::AssistantWithoutUsage,
+            Some(other) if !other.is_empty() => LineKind::OtherType(other),
+            Some(_) | None => LineKind::Unrecognised,
+        }
+    }
+
+    pub fn usage(&self) -> Option<&Usage> {
+        self.message
+            .as_ref()
+            .and_then(|message| message.usage.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Result<TranscriptLine, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn assistant_with_usage_is_priced() -> Result<(), serde_json::Error> {
+        let line =
+            parse(r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":2}}}"#)?;
+        assert!(matches!(line.classify(), LineKind::AssistantWithUsage(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn assistant_without_usage_is_counted_apart() -> Result<(), serde_json::Error> {
+        let api_error = parse(
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"model":"claude-opus-5-5"}}"#,
+        )?;
+        assert!(matches!(
+            api_error.classify(),
+            LineKind::AssistantWithoutUsage
+        ));
+        let no_message = parse(r#"{"type":"assistant"}"#)?;
+        assert!(matches!(
+            no_message.classify(),
+            LineKind::AssistantWithoutUsage
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn other_type_keeps_its_name() -> Result<(), serde_json::Error> {
+        let line = parse(r#"{"type":"user","message":{"usage":{"input_tokens":5}}}"#)?;
+        assert!(matches!(line.classify(), LineKind::OtherType("user")));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_empty_type_is_unrecognised() -> Result<(), serde_json::Error> {
+        assert!(matches!(
+            parse(r#"{"uuid":"x"}"#)?.classify(),
+            LineKind::Unrecognised
+        ));
+        assert!(matches!(
+            parse(r#"{"type":""}"#)?.classify(),
+            LineKind::Unrecognised
+        ));
+        Ok(())
     }
 }

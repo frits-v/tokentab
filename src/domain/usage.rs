@@ -27,7 +27,9 @@ impl ModelName {
 
 fn strip_snapshot_suffix(name: &str) -> &str {
     match name.rsplit_once('-') {
-        Some((stem, suffix)) if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit()) => stem,
+        Some((stem, suffix)) if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit()) => {
+            stem
+        }
         _ => name,
     }
 }
@@ -186,14 +188,26 @@ mod tests {
         assert_eq!(ModelName::decode(None), ModelName::Missing);
         assert_eq!(ModelName::decode(Some("")), ModelName::Missing);
         assert_eq!(ModelName::decode(Some("<synthetic>")), ModelName::Synthetic);
-        assert_eq!(ModelName::decode(Some("claude-opus-5-5")), ModelName::Named("claude-opus-5-5".into()));
-        assert_eq!(ModelName::decode(Some("claude-haiku-4-5-20251001")), ModelName::Named("claude-haiku-4-5".into()));
-        assert_eq!(ModelName::decode(Some("claude-opus-4-5-20251101")), ModelName::Named("claude-opus-4-5".into()));
+        assert_eq!(
+            ModelName::decode(Some("claude-opus-5-5")),
+            ModelName::Named("claude-opus-5-5".into())
+        );
+        assert_eq!(
+            ModelName::decode(Some("claude-haiku-4-5-20251001")),
+            ModelName::Named("claude-haiku-4-5".into())
+        );
+        assert_eq!(
+            ModelName::decode(Some("claude-opus-4-5-20251101")),
+            ModelName::Named("claude-opus-4-5".into())
+        );
     }
 
     #[test]
     fn snapshot_suffix_needs_exactly_eight_digits() {
-        assert_eq!(strip_snapshot_suffix("claude-sonnet-5-5"), "claude-sonnet-5-5");
+        assert_eq!(
+            strip_snapshot_suffix("claude-sonnet-5-5"),
+            "claude-sonnet-5-5"
+        );
         assert_eq!(strip_snapshot_suffix("model-1234567"), "model-1234567");
         assert_eq!(strip_snapshot_suffix("model-123456789"), "model-123456789");
     }
@@ -203,16 +217,28 @@ mod tests {
         assert_eq!(Entrypoint::decode(Some("cli")), Entrypoint::Interactive);
         assert_eq!(Entrypoint::decode(Some("sdk-cli")), Entrypoint::Sdk);
         assert_eq!(Entrypoint::decode(Some("sdk-py")), Entrypoint::Sdk);
-        assert_eq!(Entrypoint::decode(Some("claude-desktop")), Entrypoint::Desktop);
+        assert_eq!(
+            Entrypoint::decode(Some("claude-desktop")),
+            Entrypoint::Desktop
+        );
         assert_eq!(Entrypoint::decode(None), Entrypoint::Missing);
-        assert_eq!(Entrypoint::decode(Some("vscode-2030")), Entrypoint::Unrecognised("vscode-2030".into()));
+        assert_eq!(
+            Entrypoint::decode(Some("vscode-2030")),
+            Entrypoint::Unrecognised("vscode-2030".into())
+        );
         assert!(Entrypoint::Sdk.credits_eligible());
         assert!(!Entrypoint::Unrecognised("x".into()).credits_eligible());
     }
 
     #[test]
     fn prompt_tokens_count_every_input_token() {
-        let tokens = TokenUsage { input: 2, output: 9, cache_read: 100, cache_write_5m: 10, cache_write_1h: 20 };
+        let tokens = TokenUsage {
+            input: 2,
+            output: 9,
+            cache_read: 100,
+            cache_write_5m: 10,
+            cache_write_1h: 20,
+        };
         assert_eq!(tokens.prompt_tokens(), 132);
         assert_eq!(tokens.cache_write(), 30);
     }

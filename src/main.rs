@@ -17,7 +17,11 @@ use tokentab::ports::renderer::Renderer;
 use tokentab::ports::usage_source::UsageSource;
 
 #[derive(Parser)]
-#[command(name = "tokentab", version, about = "Replays local AI coding transcripts through a price list and compares what they would have cost on each plan")]
+#[command(
+    name = "tokentab",
+    version,
+    about = "Replays local AI coding transcripts through a price list and compares what they would have cost on each plan"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -107,7 +111,8 @@ fn run() -> Result<()> {
 
 fn load_pricing(path: Option<&PathBuf>) -> Result<Loaded> {
     let text = match path {
-        Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading price list {}", path.display()))?,
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading price list {}", path.display()))?,
         None => pricing_toml::DEFAULT_PRICING.to_string(),
     };
     Ok(pricing_toml::load(&text)?)
@@ -117,7 +122,8 @@ fn estimate(args: EstimateArgs) -> Result<()> {
     let loaded = load_pricing(args.pricing.as_ref())?;
     let projects_dir = match args.projects_dir {
         Some(dir) => dir,
-        None => ClaudeCodeTranscripts::default_dir().context("cannot find the home directory; pass --projects-dir")?,
+        None => ClaudeCodeTranscripts::default_dir()
+            .context("cannot find the home directory; pass --projects-dir")?,
     };
     let filter = ScanFilter {
         since: args.since.as_deref().map(parse_utc_date).transpose()?,
@@ -136,8 +142,8 @@ fn estimate(args: EstimateArgs) -> Result<()> {
         },
         allowance_anchor: args.allowance_anchor.map(anchor_from_arg).transpose()?,
     };
-    if args.seats == 0 {
-        bail!("--seats must be at least 1");
+    if args.seats == 0 || args.seats > pricing_toml::MAX_SEATS {
+        bail!("--seats must be between 1 and {}", pricing_toml::MAX_SEATS);
     }
 
     let source = ClaudeCodeTranscripts::new(projects_dir);
@@ -157,7 +163,10 @@ fn estimate(args: EstimateArgs) -> Result<()> {
 fn prices(args: PricesArgs) -> Result<()> {
     let loaded = load_pricing(args.pricing.as_ref())?;
     println!("price list as of {}", loaded.prices.as_of);
-    println!("{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}  prompt tokens over", "model", "input", "output", "cache rd", "write 5m", "write 1h");
+    println!(
+        "{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}  prompt tokens over",
+        "model", "input", "output", "cache rd", "write 5m", "write 1h"
+    );
     for model in &loaded.prices.models {
         for tier in &model.tiers {
             println!(
@@ -173,32 +182,52 @@ fn prices(args: PricesArgs) -> Result<()> {
         }
     }
     println!();
-    println!("allowance anchor {} per Pro seat per month", loaded.plans.allowance_anchor);
-    println!("{:<16} {:<18} {:>10} {:>10} {:>5} {:>9} {:>10} {:>9}", "plan", "kind", "monthly", "annual", "min", "allow x", "credits", "pool cap");
+    println!(
+        "allowance anchor {} per Pro seat per month",
+        loaded.plans.allowance_anchor
+    );
+    println!(
+        "{:<16} {:<18} {:>10} {:>10} {:>5} {:>9} {:>10} {:>9}",
+        "plan", "kind", "monthly", "annual", "min", "allow x", "credits", "pool cap"
+    );
     for plan in &loaded.plans.plans {
         println!(
             "{:<16} {:<18} {:>10} {:>10} {:>5} {:>9.1} {:>10} {:>9}",
             plan.id,
             format!("{:?}", plan.kind),
-            plan.seat_monthly.map(|money| money.to_string()).unwrap_or_else(|| "-".into()),
-            plan.seat_annual.map(|money| money.to_string()).unwrap_or_else(|| "-".into()),
+            plan.seat_monthly
+                .map(|money| money.to_string())
+                .unwrap_or_else(|| "-".into()),
+            plan.seat_annual
+                .map(|money| money.to_string())
+                .unwrap_or_else(|| "-".into()),
             plan.min_seats,
             plan.allowance_multiple,
             plan.api_credits_per_seat,
-            plan.api_credits_pool_cap.map(|money| money.to_string()).unwrap_or_else(|| "-".into()),
+            plan.api_credits_pool_cap
+                .map(|money| money.to_string())
+                .unwrap_or_else(|| "-".into()),
         );
     }
     Ok(())
 }
 
 fn parse_utc_date(text: &str) -> Result<jiff::Timestamp> {
-    let date: jiff::civil::Date = text.parse().with_context(|| format!("{text}: expected YYYY-MM-DD"))?;
-    Ok(date.to_zoned(jiff::tz::TimeZone::UTC).with_context(|| format!("{text}: not a valid UTC date"))?.timestamp())
+    let date: jiff::civil::Date = text
+        .parse()
+        .with_context(|| format!("{text}: expected YYYY-MM-DD"))?;
+    Ok(date
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .with_context(|| format!("{text}: not a valid UTC date"))?
+        .timestamp())
 }
 
 fn anchor_from_arg(usd: f64) -> Result<Money> {
-    if !usd.is_finite() || usd < 0.0 {
-        bail!("--allowance-anchor must be a non-negative number of dollars");
+    if !usd.is_finite() || !(0.0..=pricing_toml::MAX_USD_AMOUNT).contains(&usd) {
+        bail!(
+            "--allowance-anchor must be between 0 and {} dollars",
+            pricing_toml::MAX_USD_AMOUNT
+        );
     }
     Ok(Money::from_usd(usd))
 }

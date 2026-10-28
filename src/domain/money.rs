@@ -21,7 +21,10 @@ impl Money {
     /// Rounds to the nearest nanodollar. Panics on a negative or non-finite amount:
     /// prices and fees are validated at the loader boundary, so this is a programming error.
     pub fn from_usd(usd: f64) -> Money {
-        assert!(usd.is_finite() && usd >= 0.0, "money must be finite and non-negative, got {usd}");
+        assert!(
+            usd.is_finite() && usd >= 0.0,
+            "money must be finite and non-negative, got {usd}"
+        );
         Money((usd * NANOS_PER_DOLLAR as f64).round() as u64)
     }
 
@@ -43,19 +46,30 @@ impl Money {
 
     /// Scales by a non-negative factor, rounding to the nearest nanodollar.
     pub fn scale(self, factor: f64) -> Money {
-        assert!(factor.is_finite() && factor >= 0.0, "scale factor must be finite and non-negative, got {factor}");
+        assert!(
+            factor.is_finite() && factor >= 0.0,
+            "scale factor must be finite and non-negative, got {factor}"
+        );
         Money((self.0 as f64 * factor).round() as u64)
     }
 
     pub fn times(self, count: u64) -> Money {
-        Money(self.0.checked_mul(count).expect("money multiplication overflowed u64 nanodollars"))
+        Money(
+            self.0
+                .checked_mul(count)
+                .expect("loader-bounded fees times a u32 seat count fit in u64 nanodollars"),
+        )
     }
 }
 
 impl Add for Money {
     type Output = Money;
     fn add(self, other: Money) -> Money {
-        Money(self.0.checked_add(other.0).expect("money addition overflowed u64 nanodollars"))
+        Money(
+            self.0
+                .checked_add(other.0)
+                .expect("totals of bounded per-request costs stay below u64::MAX nanodollars"),
+        )
     }
 }
 
@@ -85,7 +99,7 @@ impl fmt::Display for Money {
             }
             grouped.push(digit);
         }
-        write!(f, "${grouped}.{remainder:02}")
+        f.pad(&format!("${grouped}.{remainder:02}"))
     }
 }
 
@@ -103,10 +117,16 @@ impl PerToken {
     /// Converts a published "$ per million tokens" figure. Panics when the figure
     /// is not a whole number of nanodollars per token; the loader validates first.
     pub fn from_usd_per_mtok(usd_per_mtok: f64) -> PerToken {
-        assert!(usd_per_mtok.is_finite() && usd_per_mtok >= 0.0, "price must be finite and non-negative, got {usd_per_mtok}");
+        assert!(
+            usd_per_mtok.is_finite() && usd_per_mtok >= 0.0,
+            "price must be finite and non-negative, got {usd_per_mtok}"
+        );
         let nanos_per_token = usd_per_mtok * 1_000.0;
         let rounded = nanos_per_token.round();
-        assert!((nanos_per_token - rounded).abs() < 1e-6, "price {usd_per_mtok}/MTok is not a whole number of nanodollars per token");
+        assert!(
+            (nanos_per_token - rounded).abs() < 1e-6,
+            "price {usd_per_mtok}/MTok is not a whole number of nanodollars per token"
+        );
         PerToken(rounded as u64)
     }
 
@@ -119,7 +139,9 @@ impl PerToken {
     }
 
     pub fn cost(self, tokens: u64) -> Money {
-        Money(self.0.checked_mul(tokens).expect("token cost overflowed u64 nanodollars"))
+        Money(self.0.checked_mul(tokens).expect(
+            "loader-bounded prices times adapter-bounded token counts fit in u64 nanodollars",
+        ))
     }
 }
 
@@ -129,7 +151,9 @@ mod tests {
 
     #[test]
     fn listed_prices_are_whole_nanodollars_per_token() {
-        for price in [10.0, 12.5, 20.0, 0.25, 50.0, 0.125, 0.625, 0.01, 0.05, 1.0, 0.10, 0.20, 2.50] {
+        for price in [
+            10.0, 12.5, 20.0, 0.25, 50.0, 0.125, 0.625, 0.01, 0.05, 1.0, 0.10, 0.20, 2.50,
+        ] {
             let per_token = PerToken::from_usd_per_mtok(price);
             assert!((per_token.usd_per_mtok() - price).abs() < 1e-9);
         }
@@ -139,6 +163,12 @@ mod tests {
     fn cost_of_one_million_tokens_is_the_listed_price() {
         let cost = PerToken::from_usd_per_mtok(12.5).cost(1_000_000);
         assert_eq!(cost, Money::from_usd(12.5));
+    }
+
+    #[test]
+    fn display_honours_width_and_alignment() {
+        assert_eq!(format!("{:>10}|", Money::from_usd(20.0)), "    $20.00|");
+        assert_eq!(format!("{:<10}|", Money::from_usd(20.0)), "$20.00    |");
     }
 
     #[test]
