@@ -1,0 +1,204 @@
+# Anthropic price list and plan catalog. Dollars per million tokens.
+# Source: https://platform.claude.com/docs/en/about-claude/pricing and https://claude.com/pricing
+as_of = "2026-10-28"
+
+# Claude 4.6 and later bill the full 1M context at one rate. Haiku 5.5 is the exception:
+# a request whose prompt (input + cache reads + cache writes) exceeds 100,000 tokens pays
+# the second tier for the whole request.
+
+[[models]]
+id = "claude-fable-5-1"
+display_name = "Claude Fable 5.1"
+tiers = [{ prompt_tokens_over = 0, input = 10.0, output = 50.0, cache_read = 0.25, cache_write_5m = 12.5, cache_write_1h = 20.0 }]
+
+[[models]]
+id = "claude-mythos-5-1"
+display_name = "Claude Mythos 5.1"
+tiers = [{ prompt_tokens_over = 0, input = 10.0, output = 50.0, cache_read = 0.25, cache_write_5m = 12.5, cache_write_1h = 20.0 }]
+
+[[models]]
+id = "claude-fable-5"
+display_name = "Claude Fable 5"
+tiers = [{ prompt_tokens_over = 0, input = 10.0, output = 50.0, cache_read = 1.0, cache_write_5m = 12.5, cache_write_1h = 20.0 }]
+
+[[models]]
+id = "claude-mythos-5"
+display_name = "Claude Mythos 5"
+tiers = [{ prompt_tokens_over = 0, input = 10.0, output = 50.0, cache_read = 1.0, cache_write_5m = 12.5, cache_write_1h = 20.0 }]
+
+[[models]]
+id = "claude-opus-5-5"
+display_name = "Claude Opus 5.5"
+tiers = [{ prompt_tokens_over = 0, input = 4.0, output = 20.0, cache_read = 0.20, cache_write_5m = 5.0, cache_write_1h = 8.0 }]
+
+[[models]]
+id = "claude-opus-5"
+display_name = "Claude Opus 5"
+tiers = [{ prompt_tokens_over = 0, input = 5.0, output = 25.0, cache_read = 0.50, cache_write_5m = 6.25, cache_write_1h = 10.0 }]
+
+[[models]]
+id = "claude-opus-4-8"
+display_name = "Claude Opus 4.8"
+tiers = [{ prompt_tokens_over = 0, input = 5.0, output = 25.0, cache_read = 0.50, cache_write_5m = 6.25, cache_write_1h = 10.0 }]
+
+[[models]]
+id = "claude-opus-4-7"
+display_name = "Claude Opus 4.7"
+tiers = [{ prompt_tokens_over = 0, input = 5.0, output = 25.0, cache_read = 0.50, cache_write_5m = 6.25, cache_write_1h = 10.0 }]
+
+[[models]]
+id = "claude-opus-4-6"
+display_name = "Claude Opus 4.6"
+tiers = [{ prompt_tokens_over = 0, input = 5.0, output = 25.0, cache_read = 0.50, cache_write_5m = 6.25, cache_write_1h = 10.0 }]
+
+[[models]]
+id = "claude-opus-4-5"
+display_name = "Claude Opus 4.5"
+tiers = [{ prompt_tokens_over = 0, input = 5.0, output = 25.0, cache_read = 0.50, cache_write_5m = 6.25, cache_write_1h = 10.0 }]
+
+[[models]]
+id = "claude-opus-4-1"
+display_name = "Claude Opus 4.1"
+tiers = [{ prompt_tokens_over = 0, input = 15.0, output = 75.0, cache_read = 1.50, cache_write_5m = 18.75, cache_write_1h = 30.0 }]
+
+[[models]]
+id = "claude-opus-4"
+display_name = "Claude Opus 4"
+tiers = [{ prompt_tokens_over = 0, input = 15.0, output = 75.0, cache_read = 1.50, cache_write_5m = 18.75, cache_write_1h = 30.0 }]
+
+[[models]]
+id = "claude-sonnet-5-5"
+display_name = "Claude Sonnet 5.5"
+tiers = [{ prompt_tokens_over = 0, input = 2.0, output = 10.0, cache_read = 0.10, cache_write_5m = 2.5, cache_write_1h = 4.0 }]
+
+[[models]]
+id = "claude-sonnet-5"
+display_name = "Claude Sonnet 5"
+tiers = [{ prompt_tokens_over = 0, input = 2.0, output = 10.0, cache_read = 0.20, cache_write_5m = 2.5, cache_write_1h = 4.0 }]
+
+[[models]]
+id = "claude-sonnet-4-6"
+display_name = "Claude Sonnet 4.6"
+tiers = [{ prompt_tokens_over = 0, input = 3.0, output = 15.0, cache_read = 0.30, cache_write_5m = 3.75, cache_write_1h = 6.0 }]
+
+[[models]]
+id = "claude-sonnet-4-5"
+display_name = "Claude Sonnet 4.5"
+tiers = [{ prompt_tokens_over = 0, input = 3.0, output = 15.0, cache_read = 0.30, cache_write_5m = 3.75, cache_write_1h = 6.0 }]
+
+[[models]]
+id = "claude-sonnet-4"
+display_name = "Claude Sonnet 4"
+tiers = [{ prompt_tokens_over = 0, input = 3.0, output = 15.0, cache_read = 0.30, cache_write_5m = 3.75, cache_write_1h = 6.0 }]
+
+[[models]]
+id = "claude-haiku-5-5"
+display_name = "Claude Haiku 5.5"
+tiers = [
+  { prompt_tokens_over = 0, input = 0.10, output = 0.50, cache_read = 0.01, cache_write_5m = 0.125, cache_write_1h = 0.20 },
+  { prompt_tokens_over = 100000, input = 0.50, output = 2.50, cache_read = 0.05, cache_write_5m = 0.625, cache_write_1h = 1.0 },
+]
+
+[[models]]
+id = "claude-haiku-4-5"
+display_name = "Claude Haiku 4.5"
+tiers = [{ prompt_tokens_over = 0, input = 1.0, output = 5.0, cache_read = 0.10, cache_write_5m = 1.25, cache_write_1h = 2.0 }]
+
+[[models]]
+id = "claude-3-5-haiku"
+display_name = "Claude Haiku 3.5"
+tiers = [{ prompt_tokens_over = 0, input = 0.80, output = 4.0, cache_read = 0.08, cache_write_5m = 1.0, cache_write_1h = 1.60 }]
+
+# Plans. Seat prices are per seat per month. Anthropic publishes included usage as
+# ratios only: Pro is at least 5x Free, Max is 5x or 20x Pro, a Premium seat is 5x a
+# Standard seat. `allowance_anchor_usd` is the single assumption that turns those
+# ratios into dollars: the API-equivalent usage one Pro seat gets in a month. Every
+# plan's allowance is `allowance_anchor_usd * allowance_multiple`. The report prints
+# the same numbers with the anchor halved and doubled.
+#
+# API credits (added October 2026) are monthly Claude Platform credits bundled with
+# Max and Team. They cover the API, the Agent SDK and headless `claude -p` runs, not
+# interactive Claude Code, so the estimate applies them to SDK-entrypoint usage only.
+
+[plans]
+allowance_anchor_usd = 60.0
+
+[[plans.plan]]
+id = "api"
+name = "API pay-as-you-go"
+kind = "pay_as_you_go"
+min_seats = 1
+allowance_multiple = 0.0
+api_credits_per_seat_usd = 0.0
+extra_usage_at_api_rates = true
+
+[[plans.plan]]
+id = "pro"
+name = "Pro"
+kind = "subscription"
+seat_monthly_usd = 20.0
+seat_annual_usd = 17.0
+min_seats = 1
+max_seats = 1
+allowance_multiple = 1.0
+api_credits_per_seat_usd = 0.0
+extra_usage_at_api_rates = true
+
+[[plans.plan]]
+id = "max5"
+name = "Max 5x"
+kind = "subscription"
+seat_monthly_usd = 100.0
+min_seats = 1
+max_seats = 1
+allowance_multiple = 5.0
+api_credits_per_seat_usd = 100.0
+extra_usage_at_api_rates = true
+
+[[plans.plan]]
+id = "max20"
+name = "Max 20x"
+kind = "subscription"
+seat_monthly_usd = 200.0
+min_seats = 1
+max_seats = 1
+allowance_multiple = 20.0
+api_credits_per_seat_usd = 200.0
+extra_usage_at_api_rates = true
+
+# A Standard seat has "more usage than Pro" with no published multiple; 1.0 is the floor.
+[[plans.plan]]
+id = "team_standard"
+name = "Team Standard seat"
+kind = "subscription"
+seat_monthly_usd = 25.0
+seat_annual_usd = 20.0
+min_seats = 2
+max_seats = 150
+allowance_multiple = 1.0
+api_credits_per_seat_usd = 20.0
+api_credits_pool_cap_usd = 500.0
+extra_usage_at_api_rates = true
+
+[[plans.plan]]
+id = "team_premium"
+name = "Team Premium seat"
+kind = "subscription"
+seat_monthly_usd = 125.0
+seat_annual_usd = 100.0
+min_seats = 2
+max_seats = 150
+allowance_multiple = 5.0
+api_credits_per_seat_usd = 100.0
+api_credits_pool_cap_usd = 500.0
+extra_usage_at_api_rates = true
+
+[[plans.plan]]
+id = "enterprise"
+name = "Enterprise"
+kind = "seat_plus_usage"
+seat_annual_usd = 20.0
+min_seats = 20
+allowance_multiple = 0.0
+api_credits_per_seat_usd = 0.0
+extra_usage_at_api_rates = true
