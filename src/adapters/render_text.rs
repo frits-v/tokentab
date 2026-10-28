@@ -7,7 +7,8 @@
 //! 2. Usage by month: month, requests, interactive API-equivalent, headless API-equivalent,
 //!    total, unpriced; then the unpriced requests that fall in no listed month.
 //! 3. Plans: one row per plan with seats billed, average month, peak month, total over
-//!    the range, then per-plan notes and the sensitivity line (anchor halved / doubled).
+//!    the range; a month-by-plan table of each month's cost on each plan; then per-plan
+//!    notes and the sensitivity line (anchor halved / doubled).
 //! 4. Patterns: peak 5-hour window and peak 7-day window (or "unavailable at day
 //!    granularity"), active days, sessions, sidechain share, per-model table with
 //!    tokens and cost, per-entrypoint table, top projects, cache stats with the

@@ -33,7 +33,7 @@ tokentab prices                         # the compiled-in price list and plan ca
 
 1. Scan counts: files seen, lines read, unparseable lines, assistant lines, requests before and after deduplication, requests filtered out, and every request the price list could not price, by reason. A run that finds no files or prices nothing exits non-zero instead of printing a clean zero.
 2. Usage by month at API rates, split into interactive and headless (SDK) usage.
-3. One row per plan: average month, peak month, and the total over the range, followed by the assumptions each number rests on.
+3. One row per plan: seats billed, average month, peak month, and the total over the range; then a month-by-plan table of what each month would have cost on each plan; then the assumptions each number rests on.
 4. Usage patterns: the most expensive rolling 5-hour window and 7-day window, active days, sessions, sidechain (subagent) share, cost per model, per entry point and per project, and cache statistics with a no-cache counterfactual.
 5. The assumptions in force: price list date, allowance anchor, seats, billing cycle, credits mode.
 
