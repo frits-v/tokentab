@@ -1,0 +1,29 @@
+[package]
+name = "tokentab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Replays local AI coding transcripts through a price list and compares what they would have cost on each plan"
+license = "MIT"
+repository = "https://github.com/frits-v/tokentab"
+
+[[bin]]
+name = "tokentab"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jiff = { version = "0.2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.9"
+walkdir = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "allow"

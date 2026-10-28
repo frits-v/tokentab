@@ -1,0 +1,14 @@
+{
+  "pre-commit": {
+    "commands": {
+      "fmt": { "run": "mise run fmt" }
+    }
+  },
+  "pre-push": {
+    "commands": {
+      "clippy": { "run": "mise run clippy" },
+      "test": { "run": "mise run test" },
+      "workflows": { "glob": ".github/**", "run": "mise run workflows" }
+    }
+  }
+}
