@@ -1,0 +1,42 @@
+min_version = "2026.9.2"
+
+[tools]
+# mr_boxington runs cargo through mbx, the shared compiler-output cache.
+rust = { version = "1.95", components = "rustfmt,clippy", mr_boxington = true }
+mr-boxington = "1.28.0"
+lefthook = "2.2.2"
+zizmor = "1.31.1"
+"github:jdx/jactionlint" = "2.3.0"
+gh = "2.103.3"
+
+[tasks.ci]
+description = "Every check ci runs: format, clippy, tests, workflow audits"
+run = ["mise run fmt", "mise run clippy", "mise run test", "mise run workflows"]
+
+[tasks.fmt]
+description = "rustfmt over the crate, failing on any difference"
+run = "cargo fmt --check"
+
+[tasks.clippy]
+description = "clippy over every target with warnings as errors"
+run = "cargo clippy --all-targets --locked -- -D warnings"
+
+[tasks.test]
+description = "The test suite"
+run = "cargo test --locked"
+
+[tasks.workflows]
+description = "Audit the GitHub workflows with zizmor and jactionlint at pedantic; set GH_TOKEN for the online checks"
+run = ["zizmor --pedantic .github/workflows", "jactionlint --strict-exit"]
+
+[tasks.hooks]
+description = "Install the git hooks"
+run = "lefthook install"
+
+[tasks.cache-trim]
+description = "Collect the mbx store down to the size ci saves"
+run = "mbx gc --max-size 1GiB"
+
+[tasks.estimate]
+description = "Run the estimator on this machine's transcripts: mise run estimate -- --since 2026-09-01"
+run = "cargo run --release --quiet -- estimate"

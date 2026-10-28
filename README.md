@@ -70,3 +70,16 @@ tests/fixtures  small transcripts covering streamed duplicates, synthetic turns,
 ## Updating prices
 
 Edit `pricing/anthropic.toml`, bump `as_of`, and rebuild. The loader rejects unknown fields, negative prices, duplicate ids and plans without a seat price.
+
+## Development
+
+Tool versions and tasks live in `mise.toml`.
+
+```sh
+mise install        # rust with rustfmt and clippy, mr-boxington, lefthook, zizmor, jactionlint, gh
+mise run hooks      # lefthook: fmt on commit; clippy, tests and workflow audits on push
+mise run ci         # everything the ci workflow runs
+mise run estimate -- --since 2026-09-01
+```
+
+Cargo runs through mbx, a shared compiler-output cache that mise wires in through the `mr_boxington` flag on the rust pin, so `target` is a link into the cache's own directory for this checkout. The ci workflow restores the mbx store and the cargo registry on every run and saves them only after a passing push to the default branch, so a pull request never writes compiler outputs another run reads.

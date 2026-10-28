@@ -1,0 +1,11 @@
+profile: pedantic
+online: true
+rules:
+  # A workflow checks out, restores or saves the build cache, installs the mise pins and
+  # runs one mise task; every check lives in mise.toml, so no other action has a job.
+  forbidden-uses:
+    allow:
+      - actions/checkout
+      - actions/cache/restore
+      - actions/cache/save
+      - jdx/mise-action
